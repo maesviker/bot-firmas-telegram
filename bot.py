@@ -1,10 +1,8 @@
 import os
 import json
-import base64
 import time
 import threading
 from datetime import datetime
-
 from typing import Optional, Dict, Any
 
 import requests
@@ -18,7 +16,6 @@ from sqlalchemy import (
     String,
     Text,
     DateTime,
-    Boolean,
     ForeignKey,
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
@@ -30,6 +27,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 # ---------------------------------------------------------------------
 # 1. TOKEN DEL BOT DE TELEGRAM (OBLIGATORIO)
 # ---------------------------------------------------------------------
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
     raise RuntimeError(
@@ -37,7 +35,7 @@ if not TELEGRAM_TOKEN:
         "Configúrala en tu entorno local y en Railway."
     )
 
-# Ruta "secreta" del webhook. Por defecto usamos el propio token.
+# Ruta “secreta” del webhook. Si no defines nada, se usa el propio token.
 WEBHOOK_SECRET_PATH = os.getenv("WEBHOOK_SECRET_PATH", TELEGRAM_TOKEN)
 
 # URL base de la API de Telegram
@@ -46,11 +44,13 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 # ---------------------------------------------------------------------
 # 2. CONFIGURACIÓN API HÉRCULES (TOKEN + URL BASE)
 # ---------------------------------------------------------------------
-API_TOKEN = os.getenv("HERCULES_TOKEN")
+
+# Intentamos primero HERCULES_TOKEN y si no, API_TOKEN
+API_TOKEN = os.getenv("HERCULES_TOKEN") or os.getenv("API_TOKEN")
 if not API_TOKEN:
     raise RuntimeError(
-        "Falta la variable de entorno HERCULES_TOKEN. "
-        "Configúrala con el token de la API Hércules (por ejemplo 'mvk')."
+        "Falta la variable de entorno HERCULES_TOKEN (o API_TOKEN). "
+        "Configúrala con el token de la API Hércules."
     )
 
 API_BASE = os.getenv(
@@ -61,30 +61,38 @@ API_BASE = os.getenv(
 # ---------------------------------------------------------------------
 # 3. PARÁMETROS DE POLLING A /resultados DE HÉRCULES
 # ---------------------------------------------------------------------
+
 RESULTADOS_INTERVALO = int(os.getenv("RESULTADOS_INTERVALO", "4"))
 RESULTADOS_TIMEOUT = int(os.getenv("RESULTADOS_TIMEOUT", "60"))
 
 # ---------------------------------------------------------------------
 # 4. CONFIGURACIÓN DE BASE DE DATOS (SQLAlchemy)
 # ---------------------------------------------------------------------
+
 Base = declarative_base()
 
+# Nombre de la BD local (SQLite) para pruebas
 local_db_name = os.getenv("LOCAL_DB_NAME", "bot_hercules.db")
 local_sqlite_url = f"sqlite:///{local_db_name}"
 
+# Prioridad:
+#  1) DATABASE_URL  (Railway)
+#  2) MYSQL_URL
+#  3) sqlite local
 DATABASE_URL = (
     os.getenv("DATABASE_URL")
     or os.getenv("MYSQL_URL")
     or local_sqlite_url
 )
 
-# Ajustamos driver de MySQL
+# Si viene “mysql://” lo cambiamos a “mysql+pymysql://”
 if DATABASE_URL.startswith("mysql://"):
     DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+pymysql://", 1)
 
+# Aseguramos charset para MySQL
 if DATABASE_URL.startswith("mysql+pymysql://") and "charset=" not in DATABASE_URL:
-    separador = "&" if "?" in DATABASE_URL else "?"
-    DATABASE_URL = f"{DATABASE_URL}{separador}charset=utf8mb4"
+    sep = "&" if "?" in DATABASE_URL else "?"
+    DATABASE_URL = f"{DATABASE_URL}{sep}charset=utf8mb4"
 
 engine = create_engine(DATABASE_URL, echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
@@ -95,8 +103,9 @@ SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 class Usuario(Base):
     """
-    Usuario de Telegram.
+    Usuario de Telegram que usa el bot.
     """
+
     __tablename__ = "usuarios"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -107,8 +116,10 @@ class Usuario(Base):
 
     rol = Column(String(32), default="user", nullable=False)
 
+    # Créditos totales y usados
     creditos_total = Column(Integer, default=10, nullable=False)
     creditos_usados = Column(Integer, default=0, nullable=False)
+
     ultima_consulta = Column(DateTime, nullable=True)
 
     mensajes = relationship("Mensaje", back_populates="usuario")
@@ -118,17 +129,21 @@ class Mensaje(Base):
     """
     Cada consulta realizada por el usuario.
     """
+
     __tablename__ = "mensajes"
 
     id = Column(Integer, primary_key=True, index=True)
     usuario_id = Column(Integer, ForeignKey("usuarios.id"), nullable=False)
 
-    tipo_consulta = Column(Integer, nullable=False)          # 1..8
-    nombre_servicio = Column(String(50), nullable=False)     # "firma", "persona", etc.
-    parametros = Column(Text, nullable=True)                 # JSON string
+    tipo_consulta = Column(Integer, nullable=False)      # 1..8
+    nombre_servicio = Column(String(50), nullable=False) # "firma", "persona", etc.
+
+    parametros = Column(Text, nullable=True)            # JSON serializado
     creditos_costo = Column(Integer, default=0, nullable=False)
 
+    # pendiente / exito / error / sin_datos
     estado = Column(String(20), default="pendiente", nullable=False)
+
     respuesta_bruta = Column(Text, nullable=True)
     mensaje_error = Column(Text, nullable=True)
 
@@ -139,18 +154,21 @@ class Mensaje(Base):
 
 class ConsultaConfig(Base):
     """
-    Configuración de precio y estado por tipo de consulta.
+    Configuración por tipo de consulta (precio y estado).
     """
+
     __tablename__ = "consultas_config"
 
     id = Column(Integer, primary_key=True, index=True)
     tipo_consulta = Column(Integer, unique=True, nullable=False)
     nombre_servicio = Column(String(50), nullable=False)
+
     valor_consulta = Column(Integer, default=5000, nullable=False)
     estado_consulta = Column(String(20), default="ACTIVA", nullable=False)
 
+
 # =====================================================================
-# CONSTANTES TIPO CONSULTA
+# CONSTANTES PARA TIPOS DE CONSULTA
 # =====================================================================
 
 TIPO_CONSULTA_VEHICULO_PERSONA = 1
@@ -161,12 +179,12 @@ TIPO_CONSULTA_PERSONA = 5
 TIPO_CONSULTA_FIRMA = 8
 
 # =====================================================================
-# INICIALIZACIÓN BD
+# INICIALIZACIÓN DE BD
 # =====================================================================
 
 def init_db() -> None:
     """
-    Crea tablas y precarga consultas_config si está vacía.
+    Crea tablas si no existen y precarga consultas_config si está vacío.
     """
     Base.metadata.create_all(bind=engine)
 
@@ -207,19 +225,24 @@ def init_db() -> None:
     finally:
         db.close()
 
+
 init_db()
 
 # =====================================================================
-# AUXILIARES BD
+# AUXILIARES DE BD
 # =====================================================================
 
 def get_db():
     return SessionLocal()
 
+
 def get_or_create_usuario_from_update(update: dict) -> Usuario:
+    """
+    Obtiene (o crea) el Usuario a partir del update de Telegram.
+    """
     message = update.get("message") or update.get("edited_message")
     if not message:
-        raise ValueError("Update de Telegram sin 'message' ni 'edited_message'.")
+        raise ValueError("Update sin 'message' ni 'edited_message'.")
 
     from_user = message["from"]
     telegram_id = str(from_user["id"])
@@ -254,6 +277,7 @@ def get_or_create_usuario_from_update(update: dict) -> Usuario:
     finally:
         db.close()
 
+
 def get_consulta_config(tipo_consulta: int) -> Optional[ConsultaConfig]:
     db = get_db()
     try:
@@ -265,8 +289,10 @@ def get_consulta_config(tipo_consulta: int) -> Optional[ConsultaConfig]:
     finally:
         db.close()
 
+
 def usuario_creditos_disponibles(usuario: Usuario) -> int:
     return max(usuario.creditos_total - usuario.creditos_usados, 0)
+
 
 def registrar_mensaje_pendiente(
     usuario: Usuario,
@@ -275,9 +301,13 @@ def registrar_mensaje_pendiente(
     parametros: Dict[str, Any],
     valor_consulta: int,
 ) -> int:
+    """
+    Registra un mensaje en estado 'pendiente' (sin cobrar aún).
+    """
     db = get_db()
     try:
         usuario_db = db.query(Usuario).filter_by(id=usuario.id).one()
+
         msg = Mensaje(
             usuario_id=usuario_db.id,
             tipo_consulta=tipo_consulta,
@@ -293,10 +323,11 @@ def registrar_mensaje_pendiente(
     finally:
         db.close()
 
-def marcar_mensaje_exito_y_cobrar(
-    mensaje_id: int,
-    respuesta_bruta: dict,
-) -> None:
+
+def marcar_mensaje_exito_y_cobrar(mensaje_id: int, respuesta_bruta: dict) -> None:
+    """
+    Marca mensaje como 'exito', guarda la respuesta y descuenta créditos.
+    """
     db = get_db()
     try:
         msg = db.query(Mensaje).filter_by(id=mensaje_id).one_or_none()
@@ -304,7 +335,6 @@ def marcar_mensaje_exito_y_cobrar(
             return
 
         usuario = db.query(Usuario).filter_by(id=msg.usuario_id).one()
-
         msg.estado = "exito"
         msg.respuesta_bruta = json.dumps(respuesta_bruta, ensure_ascii=False)
 
@@ -315,12 +345,16 @@ def marcar_mensaje_exito_y_cobrar(
     finally:
         db.close()
 
+
 def marcar_mensaje_error_o_sin_datos(
     mensaje_id: int,
     estado: str,
     mensaje_error: str = "",
     respuesta_bruta: Optional[dict] = None,
 ) -> None:
+    """
+    Marca mensaje como 'error' o 'sin_datos'. No cobra créditos.
+    """
     db = get_db()
     try:
         msg = db.query(Mensaje).filter_by(id=mensaje_id).one_or_none()
@@ -331,28 +365,28 @@ def marcar_mensaje_error_o_sin_datos(
         msg.mensaje_error = mensaje_error or estado
         if respuesta_bruta is not None:
             msg.respuesta_bruta = json.dumps(respuesta_bruta, ensure_ascii=False)
+
         db.commit()
     finally:
         db.close()
 
+
 # =====================================================================
-# TELEGRAM: TEXTOS Y ENVÍO DE MENSAJES
+# TEXTOS Y TECLADOS DE TELEGRAM
 # =====================================================================
 
+# Intentamos importar textos.py
 try:
     import textos
 except ImportError:
     class textos:
         MENSAJE_BIENVENIDA = (
             "👋 *Bienvenido al bot de consultas*\n\n"
-            "Estoy listo para tus consultas ✅\n"
+            "Estoy listo para tus consultas ✅\n\n"
+            "Usa los botones de abajo o escribe `CC 123456789` para una consulta rápida de firma."
         )
-        MENSAJE_SIN_CREDITOS = (
-            "⚠️ No tienes créditos suficientes para realizar esta consulta."
-        )
-        MENSAJE_ERROR_GENERICO = (
-            "❌ Ocurrió un error realizando la consulta. Inténtalo más tarde."
-        )
+        MENSAJE_SIN_CREDITOS = "⚠️ No tienes créditos suficientes para realizar esta consulta."
+        MENSAJE_ERROR_GENERICO = "❌ Ocurrió un error realizando la consulta. Inténtalo más tarde."
         MENSAJE_SIN_DATOS = "ℹ️ No se encontraron datos para los parámetros enviados."
         MENSAJE_SALDO = (
             "💰 *Tu saldo de créditos*\n\n"
@@ -360,6 +394,28 @@ except ImportError:
             "Usados: {usados}\n"
             "Disponibles: {disponibles}\n"
         )
+        FIRMA_ELEGIDA_TEXTO = (
+            "✍️ Has elegido *Consulta de firma*.\n\n"
+            "Primero selecciona el *tipo de documento* 👇"
+        )
+        FIRMA_PEDIR_NUMERO = (
+            "✍️ Escribe ahora el número de documento para *firma* ({tipo_doc}), "
+            "sin puntos ni comas:"
+        )
+        PERSONA_INSTRUCCIONES = (
+            "🧍 Envía el documento de la persona en el formato:\n"
+            "`CC 123456789`"
+        )
+        VEHICULO_INSTRUCCIONES = (
+            "🚗 Envía la placa del vehículo (sin espacios), por ejemplo:\n`ABC123`"
+        )
+        PROPIETARIO_INSTRUCCIONES = (
+            "👤 Envía la placa del vehículo (sin espacios) para consultar el propietario:"
+        )
+        MENSAJE_NO_ENTENDI = (
+            "No entendí tu mensaje. Usa el menú o el formato rápido `CC 123456789`."
+        )
+
 
 def enviar_mensaje(chat_id: int, texto: str, reply_markup: Optional[dict] = None):
     payload = {
@@ -376,6 +432,7 @@ def enviar_mensaje(chat_id: int, texto: str, reply_markup: Optional[dict] = None
     except Exception as e:
         print(f"[ERROR] Enviando mensaje a Telegram: {e}")
 
+
 def teclado_menu_principal():
     return {
         "keyboard": [
@@ -387,19 +444,28 @@ def teclado_menu_principal():
         "one_time_keyboard": False,
     }
 
-def teclado_tipos_documento():
+
+def teclado_tipos_documento_firma():
     """
-    Teclado para elegir tipo de documento (sin asumir nada).
+    Botones de tipo de documento para consulta de firma.
     """
     return {
         "keyboard": [
             ["CC - Cédula", "TI - Tarjeta de Identidad"],
             ["CE - Cédula de Extranjería", "NIT"],
-            ["🔙 Volver al menú"],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
     }
+
+
+# Mapa texto del botón -> código de tipo de documento
+MAPA_BOTON_TIPO_DOC = {
+    "CC - Cédula": "CC",
+    "TI - Tarjeta de Identidad": "TI",
+    "CE - Cédula de Extranjería": "CE",
+    "NIT": "NIT",
+}
 
 # =====================================================================
 # ESTADO EN MEMORIA POR USUARIO
@@ -407,8 +473,13 @@ def teclado_tipos_documento():
 
 user_states: Dict[int, Dict[str, Any]] = {}
 
+
 def set_user_state(chat_id: int, estado: Optional[str], datos: Optional[Dict[str, Any]] = None):
-    user_states[chat_id] = {"estado": estado, "datos": datos or {}}
+    if estado is None:
+        user_states.pop(chat_id, None)
+    else:
+        user_states[chat_id] = {"estado": estado, "datos": datos or {}}
+
 
 def get_user_state(chat_id: int) -> Dict[str, Any]:
     return user_states.get(chat_id, {"estado": None, "datos": {}})
@@ -418,6 +489,10 @@ def get_user_state(chat_id: int) -> Dict[str, Any]:
 # =====================================================================
 
 def llamar_iniciar_consulta(payload: dict) -> str:
+    """
+    Llama a IniciarConsulta y devuelve IdPeticion.
+    Con logs detallados en caso de error HTTP.
+    """
     url = f"{API_BASE}/api/Hercules/Consulta/Inicio/IniciarConsulta"
     headers = {
         "Content-Type": "application/json",
@@ -425,8 +500,18 @@ def llamar_iniciar_consulta(payload: dict) -> str:
     }
 
     print(f"[DEBUG] IniciarConsulta payload: {payload}")
-    resp = requests.post(url, headers=headers, json=payload, timeout=30)
-    resp.raise_for_status()
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "N/A"
+        body = e.response.text if e.response is not None else "N/A"
+        print(f"[ERROR] HTTP IniciarConsulta status={status}, body={body}")
+        raise
+    except Exception as e:
+        print(f"[ERROR] IniciarConsulta error genérico: {e}")
+        raise
+
     data = resp.json()
     print(f"[DEBUG] Respuesta IniciarConsulta: {data}")
 
@@ -434,6 +519,7 @@ def llamar_iniciar_consulta(payload: dict) -> str:
     if not id_peticion:
         raise RuntimeError("La respuesta de IniciarConsulta no trae IdPeticion.")
     return id_peticion
+
 
 def llamar_resultados(tipo_consulta: int, mensaje: str, id_peticion: str) -> dict:
     url = f"{API_BASE}/api/Hercules/Consulta/Inicio/Resultados"
@@ -454,7 +540,11 @@ def llamar_resultados(tipo_consulta: int, mensaje: str, id_peticion: str) -> dic
     print(f"[DEBUG] Respuesta Resultados: {data}")
     return data
 
+
 def es_respuesta_exitosa_hercules(data: dict) -> bool:
+    """
+    Determina si la respuesta cuenta como exitosa para COBRAR.
+    """
     try:
         if data.get("Tipo") != 0:
             return False
@@ -480,6 +570,7 @@ def es_respuesta_exitosa_hercules(data: dict) -> bool:
         print(f"[ERROR] Analizando respuesta de Hércules: {e}")
         return False
 
+
 def ejecutar_consulta_en_hilo(
     chat_id: int,
     usuario: Usuario,
@@ -489,6 +580,11 @@ def ejecutar_consulta_en_hilo(
     texto_pendiente: str,
     formateador_respuesta,
 ):
+    """
+    Hilo que hace polling a /Resultados, decide éxito / error, actualiza BD
+    y envía el mensaje formateado.
+    """
+
     def _run():
         try:
             deadline = time.time() + RESULTADOS_TIMEOUT
@@ -498,15 +594,17 @@ def ejecutar_consulta_en_hilo(
                 data = llamar_resultados(tipo_consulta, mensaje_parametro, texto_pendiente)
                 ultimo_data = data
 
+                tipo = data.get("Tipo")
+                mensaje = data.get("Mensaje")
                 print(
                     f"[DEBUG] Resultado parcial (tipo={tipo_consulta}, mensaje='{mensaje_parametro}'): {data}"
                 )
 
-                if data.get("Tipo") == 2:
+                if tipo == 2:
                     time.sleep(RESULTADOS_INTERVALO)
                     continue
 
-                break
+                break  # tipo 0 u otro -> salimos del bucle
 
             if not ultimo_data:
                 marcar_mensaje_error_o_sin_datos(
@@ -543,7 +641,7 @@ def ejecutar_consulta_en_hilo(
     th.start()
 
 # =====================================================================
-# FORMATEADORES RESPUESTA
+# FORMATEADORES DE RESPUESTA
 # =====================================================================
 
 def formatear_respuesta_firma(data: dict) -> str:
@@ -573,6 +671,7 @@ def formatear_respuesta_firma(data: dict) -> str:
         print(f"[ERROR] formateando respuesta de firma: {e}")
         return textos.MENSAJE_ERROR_GENERICO
 
+
 def formatear_respuesta_persona(data: dict) -> str:
     try:
         mensaje_str = data.get("Mensaje", "")
@@ -599,11 +698,11 @@ def formatear_respuesta_persona(data: dict) -> str:
         print(f"[ERROR] formateando respuesta de persona: {e}")
         return textos.MENSAJE_ERROR_GENERICO
 
+
 def formatear_respuesta_vehiculo(data: dict) -> str:
     try:
         mensaje_str = data.get("Mensaje", "")
         info = json.loads(mensaje_str)
-
         veh = info.get("vehiculo", {}) or {}
         datos = veh.get("datos", {}) or {}
 
@@ -628,6 +727,7 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
     except Exception as e:
         print(f"[ERROR] formateando respuesta de vehículo: {e}")
         return textos.MENSAJE_ERROR_GENERICO
+
 
 def formatear_respuesta_propietario(data: dict) -> str:
     try:
@@ -671,6 +771,10 @@ def formatear_respuesta_propietario(data: dict) -> str:
 # =====================================================================
 
 def iniciar_consulta_firma(usuario: Usuario, chat_id: int, tipo_doc: str, num_doc: str):
+    """
+    Consulta de firma (tipo 8).
+    No se asume tipo_doc: viene de los botones o del texto del usuario.
+    """
     config = get_consulta_config(TIPO_CONSULTA_FIRMA)
     if not config or config.estado_consulta != "ACTIVA":
         enviar_mensaje(chat_id, "⚠️ La consulta de firma está deshabilitada.")
@@ -686,11 +790,19 @@ def iniciar_consulta_firma(usuario: Usuario, chat_id: int, tipo_doc: str, num_do
     finally:
         db.close()
 
-    payload_msg = {"tipoDocumento": tipo_doc, "numeroDocumento": num_doc}
+    # Enviamos ambas variantes de campos por compatibilidad
+    payload_msg = {
+        "tipoDocumento": tipo_doc,
+        "numeroDocumento": num_doc,
+        "tipo_doc": tipo_doc,
+        "num_doc": num_doc,
+    }
+
     payload = {
         "Tipo": TIPO_CONSULTA_FIRMA,
         "Mensaje": json.dumps(payload_msg, ensure_ascii=False),
     }
+
     try:
         id_peticion = llamar_iniciar_consulta(payload)
     except Exception as e:
@@ -716,6 +828,7 @@ def iniciar_consulta_firma(usuario: Usuario, chat_id: int, tipo_doc: str, num_do
         formateador_respuesta=formatear_respuesta_firma,
     )
 
+
 def iniciar_consulta_persona(usuario: Usuario, chat_id: int, tipo_doc: str, num_doc: str):
     config = get_consulta_config(TIPO_CONSULTA_PERSONA)
     if not config or config.estado_consulta != "ACTIVA":
@@ -732,11 +845,18 @@ def iniciar_consulta_persona(usuario: Usuario, chat_id: int, tipo_doc: str, num_
     finally:
         db.close()
 
-    payload_msg = {"tipoDocumento": tipo_doc, "numeroDocumento": num_doc}
+    payload_msg = {
+        "tipoDocumento": tipo_doc,
+        "numeroDocumento": num_doc,
+        "tipo_doc": tipo_doc,
+        "num_doc": num_doc,
+    }
+
     payload = {
         "Tipo": TIPO_CONSULTA_PERSONA,
         "Mensaje": json.dumps(payload_msg, ensure_ascii=False),
     }
+
     try:
         id_peticion = llamar_iniciar_consulta(payload)
     except Exception as e:
@@ -762,6 +882,7 @@ def iniciar_consulta_persona(usuario: Usuario, chat_id: int, tipo_doc: str, num_
         formateador_respuesta=formatear_respuesta_persona,
     )
 
+
 def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
     config = get_consulta_config(TIPO_CONSULTA_VEHICULO_SOLO)
     if not config or config.estado_consulta != "ACTIVA":
@@ -780,9 +901,10 @@ def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
 
     placa_limpia = placa.replace(" ", "").upper()
     payload_msg = {"placa": placa_limpia, "solo_vehiculo": True}
+
     payload = {
         "Tipo": TIPO_CONSULTA_VEHICULO_SOLO,
-        "Mensaje": json.dumps(payload_msg),
+        "Mensaje": json.dumps(payload_msg, ensure_ascii=False),
     }
 
     try:
@@ -810,6 +932,7 @@ def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
         formateador_respuesta=formatear_respuesta_vehiculo,
     )
 
+
 def iniciar_consulta_propietario(usuario: Usuario, chat_id: int, placa: str):
     config = get_consulta_config(TIPO_CONSULTA_PROPIETARIO_POR_PLACA)
     if not config or config.estado_consulta != "ACTIVA":
@@ -828,9 +951,10 @@ def iniciar_consulta_propietario(usuario: Usuario, chat_id: int, placa: str):
 
     placa_limpia = placa.replace(" ", "").upper()
     payload_msg = {"placa": placa_limpia}
+
     payload = {
         "Tipo": TIPO_CONSULTA_PROPIETARIO_POR_PLACA,
-        "Mensaje": json.dumps(payload_msg),
+        "Mensaje": json.dumps(payload_msg, ensure_ascii=False),
     }
 
     try:
@@ -864,6 +988,7 @@ def iniciar_consulta_propietario(usuario: Usuario, chat_id: int, placa: str):
 
 app = Flask(__name__)
 
+
 @app.route(f"/webhook/{WEBHOOK_SECRET_PATH}", methods=["POST"])
 def telegram_webhook():
     update = request.get_json(force=True, silent=True) or {}
@@ -884,14 +1009,13 @@ def telegram_webhook():
 
     text = (message.get("text") or "").strip()
 
-    # ---------------- Comandos globales ----------------
+    # ----------------- COMANDOS -----------------
     if text.startswith("/start"):
         enviar_mensaje(
             chat_id,
             textos.MENSAJE_BIENVENIDA,
             reply_markup=teclado_menu_principal(),
         )
-        set_user_state(chat_id, None)
         return jsonify({"ok": True}), 200
 
     if text.startswith("/saldo"):
@@ -912,158 +1036,7 @@ def telegram_webhook():
         enviar_mensaje(chat_id, msg, reply_markup=teclado_menu_principal())
         return jsonify({"ok": True}), 200
 
-    # ---------------- Botones de menú principal ----------------
-
-    if text == "📝 Consulta de firma":
-        enviar_mensaje(
-            chat_id,
-            "✍️ Has elegido *Consulta de firma*.\n\n"
-            "Primero selecciona el *tipo de documento*: 👇",
-            reply_markup=teclado_tipos_documento(),
-        )
-        set_user_state(chat_id, "esperando_tipo_doc_firma")
-        return jsonify({"ok": True}), 200
-
-    if text == "🧍 Consulta de persona":
-        enviar_mensaje(
-            chat_id,
-            "🧍 Has elegido *Consulta de persona*.\n\n"
-            "Primero selecciona el *tipo de documento*: 👇",
-            reply_markup=teclado_tipos_documento(),
-        )
-        set_user_state(chat_id, "esperando_tipo_doc_persona")
-        return jsonify({"ok": True}), 200
-
-    if text == "🚗 Consulta de vehículo":
-        enviar_mensaje(
-            chat_id,
-            "🚗 Has elegido *Consulta de vehículo*.\n\n"
-            "Escribe ahora la placa del vehículo (sin espacios), por ejemplo:\n"
-            "`ABC123`",
-            reply_markup=teclado_menu_principal(),
-        )
-        set_user_state(chat_id, "esperando_placa_vehiculo")
-        return jsonify({"ok": True}), 200
-
-    if text == "👤 Propietario por placa":
-        enviar_mensaje(
-            chat_id,
-            "👤 Has elegido *Propietario por placa*.\n\n"
-            "Escribe ahora la placa del vehículo (sin espacios).",
-            reply_markup=teclado_menu_principal(),
-        )
-        set_user_state(chat_id, "esperando_placa_propietario")
-        return jsonify({"ok": True}), 200
-
-    # ---------------- Lógica según estado previo ----------------
-    estado_info = get_user_state(chat_id)
-    estado = estado_info.get("estado")
-    datos_estado = estado_info.get("datos", {})
-
-    # --- Selección de tipo de documento (firma / persona) ---
-    if estado == "esperando_tipo_doc_firma" or estado == "esperando_tipo_doc_persona":
-        # Botón "volver"
-        if text == "🔙 Volver al menú":
-            set_user_state(chat_id, None)
-            enviar_mensaje(
-                chat_id,
-                "Has vuelto al menú principal.",
-                reply_markup=teclado_menu_principal(),
-            )
-            return jsonify({"ok": True}), 200
-
-        # Mapeamos el texto del botón a un código de tipo de documento
-        text_upper = text.upper()
-        tipo_doc = None
-        if text_upper.startswith("CC"):
-            tipo_doc = "CC"
-        elif text_upper.startswith("TI"):
-            tipo_doc = "TI"
-        elif text_upper.startswith("CE"):
-            tipo_doc = "CE"
-        elif text_upper.startswith("NIT"):
-            tipo_doc = "NIT"
-
-        if not tipo_doc:
-            enviar_mensaje(
-                chat_id,
-                "❗ Por favor, selecciona un tipo de documento usando los botones.",
-                reply_markup=teclado_tipos_documento(),
-            )
-            return jsonify({"ok": True}), 200
-
-        # Guardamos el tipo_doc en el estado y pasamos a pedir el número
-        if estado == "esperando_tipo_doc_firma":
-            set_user_state(chat_id, "esperando_num_doc_firma", {"tipo_doc": tipo_doc})
-            enviar_mensaje(
-                chat_id,
-                f"✍️ Escribe ahora el número de documento para *firma* "
-                f"({tipo_doc}), sin puntos ni comas:",
-                reply_markup=teclado_menu_principal(),
-            )
-        else:
-            set_user_state(chat_id, "esperando_num_doc_persona", {"tipo_doc": tipo_doc})
-            enviar_mensaje(
-                chat_id,
-                f"🧍 Escribe ahora el número de documento de la *persona* "
-                f"({tipo_doc}), sin puntos ni comas:",
-                reply_markup=teclado_menu_principal(),
-            )
-
-        return jsonify({"ok": True}), 200
-
-    # --- Recibir número de documento para firma ---
-    if estado == "esperando_num_doc_firma":
-        tipo_doc = datos_estado.get("tipo_doc")
-        num_doc = text.replace(" ", "")
-        if not tipo_doc:
-            enviar_mensaje(
-                chat_id,
-                "❗ No tengo registrado el tipo de documento. "
-                "Vuelve a empezar con el menú.",
-                reply_markup=teclado_menu_principal(),
-            )
-            set_user_state(chat_id, None)
-            return jsonify({"ok": True}), 200
-
-        iniciar_consulta_firma(usuario, chat_id, tipo_doc, num_doc)
-        set_user_state(chat_id, None)
-        return jsonify({"ok": True}), 200
-
-    # --- Recibir número de documento para persona ---
-    if estado == "esperando_num_doc_persona":
-        tipo_doc = datos_estado.get("tipo_doc")
-        num_doc = text.replace(" ", "")
-        if not tipo_doc:
-            enviar_mensaje(
-                chat_id,
-                "❗ No tengo registrado el tipo de documento. "
-                "Vuelve a empezar con el menú.",
-                reply_markup=teclado_menu_principal(),
-            )
-            set_user_state(chat_id, None)
-            return jsonify({"ok": True}), 200
-
-        iniciar_consulta_persona(usuario, chat_id, tipo_doc, num_doc)
-        set_user_state(chat_id, None)
-        return jsonify({"ok": True}), 200
-
-    # --- Placa de vehículo ---
-    if estado == "esperando_placa_vehiculo":
-        placa = text.strip().upper().replace(" ", "")
-        iniciar_consulta_vehiculo(usuario, chat_id, placa)
-        set_user_state(chat_id, None)
-        return jsonify({"ok": True}), 200
-
-    # --- Placa para propietario ---
-    if estado == "esperando_placa_propietario":
-        placa = text.strip().upper().replace(" ", "")
-        iniciar_consulta_propietario(usuario, chat_id, placa)
-        set_user_state(chat_id, None)
-        return jsonify({"ok": True}), 200
-
-    # ---------------- Atajo global para firma ----------------
-    # Solo se usa si NO hay un estado pendiente.
+    # Atajo rápido: "CC 123456789"
     if text.upper().startswith(("CC ", "TI ", "CE ", "NIT ")):
         partes = text.split()
         if len(partes) >= 2:
@@ -1072,21 +1045,116 @@ def telegram_webhook():
             iniciar_consulta_firma(usuario, chat_id, tipo_doc, num_doc)
             return jsonify({"ok": True}), 200
 
-    # ---------------- Mensaje por defecto ----------------
+    # ----------------- MENÚ PRINCIPAL -----------------
+    if text == "📝 Consulta de firma":
+        enviar_mensaje(
+            chat_id,
+            textos.FIRMA_ELEGIDA_TEXTO,
+            reply_markup=teclado_tipos_documento_firma(),
+        )
+        set_user_state(chat_id, "firma_esperando_tipo")
+        return jsonify({"ok": True}), 200
+
+    if text == "🧍 Consulta de persona":
+        enviar_mensaje(
+            chat_id,
+            textos.PERSONA_INSTRUCCIONES,
+            reply_markup=teclado_menu_principal(),
+        )
+        set_user_state(chat_id, "esperando_persona")
+        return jsonify({"ok": True}), 200
+
+    if text == "🚗 Consulta de vehículo":
+        enviar_mensaje(
+            chat_id,
+            textos.VEHICULO_INSTRUCCIONES,
+            reply_markup=teclado_menu_principal(),
+        )
+        set_user_state(chat_id, "esperando_placa_vehiculo")
+        return jsonify({"ok": True}), 200
+
+    if text == "👤 Propietario por placa":
+        enviar_mensaje(
+            chat_id,
+            textos.PROPIETARIO_INSTRUCCIONES,
+            reply_markup=teclado_menu_principal(),
+        )
+        set_user_state(chat_id, "esperando_placa_propietario")
+        return jsonify({"ok": True}), 200
+
+    # ----------------- MANEJO DE ESTADOS -----------------
+    estado_info = get_user_state(chat_id)
+    estado = estado_info.get("estado")
+    datos_estado = estado_info.get("datos", {})
+
+    # Firma: usuario eligió tipo de documento
+    if estado == "firma_esperando_tipo" and text in MAPA_BOTON_TIPO_DOC:
+        tipo_doc = MAPA_BOTON_TIPO_DOC[text]
+        set_user_state(chat_id, "firma_esperando_numero", {"tipo_doc": tipo_doc})
+        enviar_mensaje(
+            chat_id,
+            textos.FIRMA_PEDIR_NUMERO.format(tipo_doc=tipo_doc),
+            reply_markup=teclado_menu_principal(),
+        )
+        return jsonify({"ok": True}), 200
+
+    # Firma: usuario envía número de documento
+    if estado == "firma_esperando_numero":
+        tipo_doc = datos_estado.get("tipo_doc")
+        num_doc = text.replace(" ", "")
+        if not tipo_doc:
+            enviar_mensaje(chat_id, textos.MENSAJE_ERROR_GENERICO)
+            set_user_state(chat_id, None)
+            return jsonify({"ok": True}), 200
+
+        iniciar_consulta_firma(usuario, chat_id, tipo_doc, num_doc)
+        set_user_state(chat_id, None)
+        return jsonify({"ok": True}), 200
+
+    # Persona: esperamos "TIPO NUMERO"
+    if estado == "esperando_persona":
+        partes = text.split()
+        if len(partes) < 2:
+            enviar_mensaje(
+                chat_id,
+                "Por favor envía el documento en el formato: `CC 123456789`",
+                reply_markup=teclado_menu_principal(),
+            )
+            return jsonify({"ok": True}), 200
+
+        tipo_doc = partes[0].upper()
+        num_doc = partes[1]
+        iniciar_consulta_persona(usuario, chat_id, tipo_doc, num_doc)
+        set_user_state(chat_id, None)
+        return jsonify({"ok": True}), 200
+
+    # Vehículo por placa
+    if estado == "esperando_placa_vehiculo":
+        placa = text.strip().upper().replace(" ", "")
+        iniciar_consulta_vehiculo(usuario, chat_id, placa)
+        set_user_state(chat_id, None)
+        return jsonify({"ok": True}), 200
+
+    # Propietario por placa
+    if estado == "esperando_placa_propietario":
+        placa = text.strip().upper().replace(" ", "")
+        iniciar_consulta_propietario(usuario, chat_id, placa)
+        set_user_state(chat_id, None)
+        return jsonify({"ok": True}), 200
+
+    # ----------------- FALLBACK -----------------
     enviar_mensaje(
         chat_id,
-        "No entendí tu mensaje. Usa el menú o el formato rápido (`CC 123456789`).",
+        textos.MENSAJE_NO_ENTENDI,
         reply_markup=teclado_menu_principal(),
     )
     return jsonify({"ok": True}), 200
+
 
 @app.route("/", methods=["GET"])
 def index():
     return "Bot de consultas de firmas funcionando ✅", 200
 
-# =====================================================================
-# MAIN LOCAL
-# =====================================================================
 
 if __name__ == "__main__":
     print("Iniciando bot Flask en http://0.0.0.0:5000/ ...")
