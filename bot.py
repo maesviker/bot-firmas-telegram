@@ -2,6 +2,7 @@ import os
 import json
 import time
 import threading
+import base64
 from datetime import datetime
 from typing import Optional, Dict, Any
 
@@ -416,6 +417,36 @@ def enviar_mensaje(chat_id: int, texto: str, reply_markup: Optional[dict] = None
         print(f"[ERROR] Enviando mensaje a Telegram: {e}")
 
 
+def enviar_documento_firma_desde_b64(chat_id: int, firma_b64: str):
+    """
+    Decodifica la firma en base64 y la envía a Telegram como documento (GIF/imagen).
+    """
+    try:
+        if not firma_b64:
+            return
+
+        image_bytes = base64.b64decode(firma_b64)
+
+        files = {
+            "document": ("firma.gif", image_bytes)  # la firma es un GIF (R0lGOD...)
+        }
+        data = {
+            "chat_id": chat_id,
+            "caption": "🖊 Firma registrada",
+        }
+
+        resp = requests.post(
+            f"{TELEGRAM_API_URL}/sendDocument",
+            data=data,
+            files=files,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        print("[DEBUG] Firma enviada como documento a Telegram")
+    except Exception as e:
+        print(f"[ERROR] Enviando imagen de firma a Telegram: {e}")
+
+
 def teclado_menu_principal():
     """
     Teclado principal.
@@ -479,12 +510,6 @@ def llamar_iniciar_consulta(tipo_consulta: int, mensaje_payload: Any) -> str:
     Además:
       - Si mensaje_payload es dict/list -> se serializa a JSON.
       - Si mensaje_payload es str -> se manda tal cual (sin json.dumps).
-
-    Nota:
-      Para algunas consultas (vehículo, propietario, firma, persona)
-      el llamador ya formatea mensaje_payload como string simple:
-        - Vehículo / propietario: "PDK400"
-        - Firma / persona: "CC,15645123"
     """
     url = f"{API_BASE}/api/IniciarConsulta"
 
@@ -603,7 +628,7 @@ def es_respuesta_exitosa_hercules(data: dict) -> bool:
                 print("[DEBUG] es_respuesta_exitosa_hercules: Error == True en mensaje_json")
                 return False
 
-            # codigoResultado distinto de EXITOSO (si viene en la raíz)
+            # codigoResultado distinto de EXITOSO
             codigo = mensaje_json.get("codigoResultado") or mensaje_json.get("codigo")
             if codigo and str(codigo).upper() != "EXITOSO":
                 print(f"[DEBUG] es_respuesta_exitosa_hercules: codigoResultado != EXITOSO -> {codigo}")
@@ -634,6 +659,8 @@ def ejecutar_consulta_en_hilo(
 ):
     """
     Hilo que hace polling a /resultados y decide si se cobra o no.
+    Ahora también permite que el formateador devuelva (texto, firma_b64)
+    para enviar la imagen de la firma en consultas tipo 8.
     """
 
     def _run():
@@ -676,8 +703,29 @@ def ejecutar_consulta_en_hilo(
 
             if es_respuesta_exitosa_hercules(ultimo_data):
                 marcar_mensaje_exito_y_cobrar(mensaje_id, ultimo_data)
-                texto_respuesta = formateador_respuesta(ultimo_data)
+
+                # formateador puede devolver:
+                #  - solo texto (str)
+                #  - (texto, firma_b64)
+                resultado_formateo = formateador_respuesta(ultimo_data)
+
+                texto_respuesta = textos.MENSAJE_ERROR_GENERICO
+                firma_b64 = None
+
+                if isinstance(resultado_formateo, tuple):
+                    if len(resultado_formateo) >= 1:
+                        texto_respuesta = resultado_formateo[0]
+                    if len(resultado_formateo) >= 2:
+                        firma_b64 = resultado_formateo[1]
+                else:
+                    texto_respuesta = resultado_formateo
+
                 enviar_mensaje(chat_id, texto_respuesta)
+
+                # Si hay firma en base64, la enviamos como documento
+                if firma_b64:
+                    enviar_documento_firma_desde_b64(chat_id, firma_b64)
+
             else:
                 marcar_mensaje_error_o_sin_datos(
                     mensaje_id,
@@ -702,9 +750,7 @@ def ejecutar_consulta_en_hilo(
 # 9. FORMATEADORES DE RESPUESTA
 # =====================================================================
 
-
-
-def formatear_respuesta_firma(data: dict) -> str:
+def formatear_respuesta_firma(data: dict):
     """
     Formatea la respuesta de consulta de firma.
 
@@ -714,41 +760,43 @@ def formatear_respuesta_firma(data: dict) -> str:
       2) Formato "nuevo": {"nombres": "...", "apellidos": "...",
                            "grupoSanguineo": "...", "sexo": "...",
                            "fechaNacimiento": "...", "lugarNacimiento": "...",
-                           "Error": false, ...}
+                           "firma": "base64...", ...}
          directamente en la raíz del JSON.
+
+    Devuelve:
+      - Solo texto (str)   -> para compatibilidad.
+      - (texto, firma_b64) -> si encuentra la firma en base64.
     """
     try:
         mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
         print(f"[DEBUG] formatear_respuesta_firma.mensaje_raw (tipo={type(mensaje_raw)}): {mensaje_raw}")
 
-        # -------------------------------------------------
         # 1) Normalizar a dict
-        # -------------------------------------------------
         info = {}
         if isinstance(mensaje_raw, str):
             try:
                 info = json.loads(mensaje_raw)
             except Exception as e:
                 print(f"[ERROR] formatear_respuesta_firma: no se pudo json.loads(mensaje_raw): {e}")
-                # Si no se puede parsear, mostramos el texto crudo
-                return (
+                # Devolvemos texto crudo
+                texto = (
                     "📝 *Resultado de consulta de firma (sin formato JSON)*\n\n"
                     f"`{mensaje_raw}`"
                 )
+                return texto
         elif isinstance(mensaje_raw, dict):
             info = mensaje_raw
         else:
             print(f"[DEBUG] formatear_respuesta_firma: mensaje_raw tipo inesperado: {type(mensaje_raw)}")
-            return (
+            texto = (
                 "📝 *Resultado de consulta de firma (formato no esperado)*\n\n"
                 f"`{str(mensaje_raw)}`"
             )
+            return texto
 
         print(f"[DEBUG] formatear_respuesta_firma.info (tipo={type(info)}): {info}")
 
-        # -------------------------------------------------
         # 2) Intentar formato "viejo": person/persona
-        # -------------------------------------------------
         person = info.get("person") or info.get("persona") or {}
         if person:
             nombre = " ".join(
@@ -761,15 +809,13 @@ def formatear_respuesta_firma(data: dict) -> str:
             ).strip()
             tipo_doc = person.get("idTipoDoc") or person.get("tipoDocumento") or ""
             nro_doc = person.get("nroDocumento") or person.get("nroDoc") or ""
+            firma_b64 = person.get("firma") or info.get("firma")
         else:
-            # -------------------------------------------------
             # 3) Formato "nuevo": campos en la raíz
-            # -------------------------------------------------
             nombres = info.get("nombres") or ""
             apellidos = info.get("apellidos") or ""
             nombre = f"{nombres} {apellidos}".strip()
 
-            # A veces no viene el doc en la respuesta de firma, pero igual lo intentamos
             tipo_doc = (
                 info.get("tipoDocumento")
                 or info.get("idTipoDoc")
@@ -782,6 +828,7 @@ def formatear_respuesta_firma(data: dict) -> str:
                 or info.get("nroDoc")
                 or ""
             )
+            firma_b64 = info.get("firma")
 
         grupo = info.get("grupoSanguineo") or "-"
         sexo = info.get("sexo") or "-"
@@ -790,7 +837,6 @@ def formatear_respuesta_firma(data: dict) -> str:
         fecha_nac_raw = info.get("fechaNacimiento")
         fecha_nac_fmt = "-"
         if isinstance(fecha_nac_raw, str) and len(fecha_nac_raw) >= 10:
-            # Tomamos solo la parte YYYY-MM-DD
             fecha_nac_fmt = fecha_nac_raw[:10]
 
         texto = (
@@ -804,12 +850,16 @@ def formatear_respuesta_firma(data: dict) -> str:
         )
 
         print(f"[DEBUG] formatear_respuesta_firma.texto: {texto!r}")
+
+        # Si tenemos firma, la devolvemos también
+        if firma_b64:
+            return texto, firma_b64
+
         return texto
 
     except Exception as e:
         print(f"[ERROR] formateando firma: {e}")
         return textos.MENSAJE_ERROR_GENERICO
-
 
 
 def formatear_respuesta_persona(data: dict) -> str:
@@ -851,21 +901,14 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
     try:
         mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
 
-        # Log de depuración para ver EXACTAMENTE qué viene de Hércules
         print(f"[DEBUG] formatear_respuesta_vehiculo.mensaje_raw (tipo={type(mensaje_raw)}): {mensaje_raw}")
 
-        # -------------------------------------------
-        # 1) Normalizar a dict: info
-        # -------------------------------------------
         info = {}
         if isinstance(mensaje_raw, str):
-            # Si es string, intentamos parsear como JSON
             try:
                 info = json.loads(mensaje_raw)
             except Exception as e:
-                # Si no se puede parsear, lo logueamos y devolvemos algo decente
                 print(f"[ERROR] formatear_respuesta_vehiculo: no se pudo json.loads(mensaje_raw): {e}")
-                # En este caso, como no hay estructura JSON, mostramos el texto tal cual
                 return (
                     "🚗 *Respuesta de vehículo (sin formato JSON)*\n\n"
                     f"`{mensaje_raw}`"
@@ -873,7 +916,6 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
         elif isinstance(mensaje_raw, dict):
             info = mensaje_raw
         else:
-            # Tipo raro, lo mostramos sin romper
             print(f"[DEBUG] formatear_respuesta_vehiculo: mensaje_raw tipo inesperado: {type(mensaje_raw)}")
             return (
                 "🚗 *Respuesta de vehículo (formato no esperado)*\n\n"
@@ -882,28 +924,21 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
 
         print(f"[DEBUG] formatear_respuesta_vehiculo.info (tipo={type(info)}): {info}")
 
-        # -------------------------------------------
-        # 2) Localizar el bloque "datos"
-        # -------------------------------------------
         datos = {}
 
-        # Caso 2: {"datos": {...}, "adicional": {...}}
         if isinstance(info, dict) and "datos" in info and isinstance(info["datos"], dict):
             datos = info["datos"]
             print("[DEBUG] formatear_respuesta_vehiculo: usando info['datos']")
         else:
-            # Caso 1: {"vehiculo": {"datos": {...}}} o {"vehiculo": {...}}
             veh = info.get("vehiculo")
             if isinstance(veh, dict):
                 if "datos" in veh and isinstance(veh["datos"], dict):
                     datos = veh["datos"]
                     print("[DEBUG] formatear_respuesta_vehiculo: usando info['vehiculo']['datos']")
                 else:
-                    # A veces todos los campos están directamente en "vehiculo"
                     datos = veh
                     print("[DEBUG] formatear_respuesta_vehiculo: usando info['vehiculo'] directo")
             else:
-                # Caso 3: los campos están directamente en la raíz del JSON
                 if any(
                     k in info
                     for k in (
@@ -921,9 +956,6 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
         datos = datos or {}
         print(f"[DEBUG] formatear_respuesta_vehiculo.datos: {datos}")
 
-        # -------------------------------------------
-        # 3) Extraer campos individuales
-        # -------------------------------------------
         placa = (
             datos.get("placaNumeroUnicoIdentificacion")
             or datos.get("placa")
@@ -1017,32 +1049,31 @@ def _verificar_creditos_o_mensaje(chat_id: int, usuario: Usuario, config: Consul
 
 def iniciar_consulta_firma(usuario: Usuario, chat_id: int, tipo_doc: str, num_doc: str):
     """
-    Consulta de firma (tipo 8).
-
-    La API espera en IniciarConsulta:
+    Para tipo 8, la API espera:
       "mensaje": "CC,15645123"
     """
     config = get_consulta_config(TIPO_CONSULTA_FIRMA)
     if not _verificar_creditos_o_mensaje(chat_id, usuario, config):
         return
 
-    # Lo que guardamos en BD (para historial)
-    parametros_db = {"tipoDocumento": tipo_doc, "numeroDocumento": num_doc}
-    # Lo que enviamos a la API Hércules
-    mensaje_payload_api = f"{tipo_doc},{num_doc}"
+    # Formato requerido por la API: "CC,15645123"
+    mensaje_payload = f"{tipo_doc},{num_doc}"
 
     try:
-        id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_FIRMA, mensaje_payload_api)
+        id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_FIRMA, mensaje_payload)
     except Exception as e:
         print(f"[ERROR] iniciar_consulta_firma -> IniciarConsulta: {e}")
         enviar_mensaje(chat_id, textos.MENSAJE_ERROR_GENERICO)
         return
 
+    # Guardamos parámetros de forma "humana" en la BD
+    parametros_guardar = {"tipoDocumento": tipo_doc, "numeroDocumento": num_doc}
+
     msg_id = registrar_mensaje_pendiente(
         usuario=usuario,
         tipo_consulta=TIPO_CONSULTA_FIRMA,
         nombre_servicio="firma",
-        parametros=parametros_db,
+        parametros=parametros_guardar,
         valor_consulta=config.valor_consulta,
     )
 
@@ -1051,28 +1082,21 @@ def iniciar_consulta_firma(usuario: Usuario, chat_id: int, tipo_doc: str, num_do
         usuario=usuario,
         mensaje_id=msg_id,
         tipo_consulta=TIPO_CONSULTA_FIRMA,
-        mensaje_parametro_str=mensaje_payload_api,
+        mensaje_parametro_str=mensaje_payload,
         id_peticion=id_peticion,
         formateador_respuesta=formatear_respuesta_firma,
     )
 
 
 def iniciar_consulta_persona(usuario: Usuario, chat_id: int, tipo_doc: str, num_doc: str):
-    """
-    Consulta de persona (tipo 5).
-
-    La API también espera:
-      "mensaje": "CC,15645123"
-    """
     config = get_consulta_config(TIPO_CONSULTA_PERSONA)
     if not _verificar_creditos_o_mensaje(chat_id, usuario, config):
         return
 
-    parametros_db = {"tipoDocumento": tipo_doc, "numeroDocumento": num_doc}
-    mensaje_payload_api = f"{tipo_doc},{num_doc}"
+    mensaje_payload = {"tipoDocumento": tipo_doc, "numeroDocumento": num_doc}
 
     try:
-        id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_PERSONA, mensaje_payload_api)
+        id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_PERSONA, mensaje_payload)
     except Exception as e:
         print(f"[ERROR] iniciar_consulta_persona -> IniciarConsulta: {e}")
         enviar_mensaje(chat_id, textos.MENSAJE_ERROR_GENERICO)
@@ -1082,7 +1106,7 @@ def iniciar_consulta_persona(usuario: Usuario, chat_id: int, tipo_doc: str, num_
         usuario=usuario,
         tipo_consulta=TIPO_CONSULTA_PERSONA,
         nombre_servicio="persona",
-        parametros=parametros_db,
+        parametros=mensaje_payload,
         valor_consulta=config.valor_consulta,
     )
 
@@ -1091,7 +1115,7 @@ def iniciar_consulta_persona(usuario: Usuario, chat_id: int, tipo_doc: str, num_
         usuario=usuario,
         mensaje_id=msg_id,
         tipo_consulta=TIPO_CONSULTA_PERSONA,
-        mensaje_parametro_str=mensaje_payload_api,
+        mensaje_parametro_str=json.dumps(mensaje_payload, ensure_ascii=False),
         id_peticion=id_peticion,
         formateador_respuesta=formatear_respuesta_persona,
     )
@@ -1109,8 +1133,6 @@ def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
         return
 
     placa_limpia = placa.replace(" ", "").upper()
-
-    # Para tipo 3, enviamos solo la placa como string
     mensaje_payload = placa_limpia
 
     try:
@@ -1142,15 +1164,13 @@ def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
 def iniciar_consulta_propietario(usuario: Usuario, chat_id: int, placa: str):
     """
     Consulta de propietario por placa (tipo 4).
-    Es muy probable que la API también espere solo la placa como string.
+    La API espera también solo la placa como string.
     """
     config = get_consulta_config(TIPO_CONSULTA_PROPIETARIO_POR_PLACA)
     if not _verificar_creditos_o_mensaje(chat_id, usuario, config):
         return
 
     placa_limpia = placa.replace(" ", "").upper()
-
-    # Enviamos solo la placa como string
     mensaje_payload = placa_limpia
 
     try:
