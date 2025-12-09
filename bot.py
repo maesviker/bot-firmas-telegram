@@ -466,52 +466,59 @@ def get_user_state(chat_id: int) -> Dict[str, Any]:
 
 def llamar_iniciar_consulta(tipo_consulta: int, mensaje_payload: Dict[str, Any]) -> str:
     """
-    Llama a POST /api/IniciarConsulta
+    Llama a POST /api/IniciarConsulta y devuelve el IdPeticion.
 
-    Request:
-      {
-        "token": HERCULES_TOKEN,
-        "tipo": <int>,
-        "mensaje": "<string>"
-      }
+    Soporta dos formatos de respuesta:
 
-    Respuesta esperada (según docs):
-      { "tipo": 0, "mensaje": "<idPeticion>" } en éxito
-      { "tipo": 1, "mensaje": "Error ..." } en error
+    1) Formato NUEVO (el que estás recibiendo ahora):
+       { "IdPeticion": "guid..." }
+
+    2) Formato ANTIGUO (por si algún día lo vuelven a usar):
+       { "Tipo": 0, "Mensaje": "guid..." }
     """
     url = f"{API_BASE}/api/IniciarConsulta"
 
+    # La API espera que 'mensaje' sea un string con JSON interno
     mensaje_str = json.dumps(mensaje_payload, ensure_ascii=False)
 
     body = {
-        "token": HERCULES_TOKEN,
-        "tipo": tipo_consulta,
-        "mensaje": mensaje_str,
+        "token": API_TOKEN,          # o HERCULES_TOKEN si así lo llamaste
+        "tipo": tipo_consulta,      # 3, 4, 5, 8, etc.
+        "mensaje": mensaje_str,     # JSON serializado como string
     }
 
     print(f"[DEBUG] IniciarConsulta payload: {body}")
 
     resp = requests.post(url, json=body, timeout=30)
 
-    if resp.status_code != 200:
-        print(f"[ERROR] HTTP IniciarConsulta status={resp.status_code}, body={resp.text}")
+    # Si el HTTP no es 200, lanzamos error y lo vemos en logs
+    try:
         resp.raise_for_status()
+    except Exception:
+        print(f"[ERROR] HTTP IniciarConsulta status={resp.status_code}, body={resp.text}")
+        raise
 
     data = resp.json()
     print(f"[DEBUG] Respuesta IniciarConsulta: {data}")
 
+    # ------- FORMATO NUEVO: { "IdPeticion": "..." } -------
+    id_peticion = data.get("IdPeticion") or data.get("idPeticion")
+    if id_peticion:
+        return str(id_peticion)
+
+    # ------- FORMATO ANTIGUO: { "Tipo": 0, "Mensaje": "..." } -------
     tipo = data.get("Tipo")
     if tipo is None:
         tipo = data.get("tipo")
 
     mensaje = data.get("Mensaje") or data.get("mensaje")
 
-    if tipo != 0 or not mensaje:
-        raise RuntimeError(f"Respuesta no exitosa de IniciarConsulta: {data}")
+    if tipo == 0 and mensaje:
+        return str(mensaje)
 
-    # El mensaje es el idPeticion
-    id_peticion = str(mensaje)
-    return id_peticion
+    # Si no encaja en ninguno de los formatos, lanzamos error
+    raise RuntimeError(f"Respuesta no esperada de IniciarConsulta: {data}")
+
 
 
 def llamar_resultados(id_peticion: str) -> dict:
