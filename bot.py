@@ -3,6 +3,7 @@ import json
 import time
 import threading
 import base64
+import io
 from datetime import datetime
 from typing import Optional, Dict, Any
 
@@ -20,6 +21,21 @@ from sqlalchemy import (
     ForeignKey,
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+
+# ReportLab y QR
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    PageBreak,
+)
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+import qrcode
 
 # =====================================================================
 # 1. CONFIGURACIÓN GENERAL
@@ -447,6 +463,31 @@ def enviar_documento_firma_desde_b64(chat_id: int, firma_b64: str):
         print(f"[ERROR] Enviando imagen de firma a Telegram: {e}")
 
 
+def enviar_documento_pdf(chat_id: int, nombre_archivo: str, pdf_bytes: bytes):
+    """
+    Envía un PDF a Telegram como documento, usando bytes en memoria.
+    """
+    try:
+        files = {
+            "document": (nombre_archivo, pdf_bytes, "application/pdf")
+        }
+        data = {
+            "chat_id": chat_id,
+            "caption": "📄 Informe vehicular generado",
+        }
+
+        resp = requests.post(
+            f"{TELEGRAM_API_URL}/sendDocument",
+            data=data,
+            files=files,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        print("[DEBUG] PDF vehicular enviado como documento a Telegram")
+    except Exception as e:
+        print(f"[ERROR] Enviando PDF vehicular a Telegram: {e}")
+
+
 def teclado_menu_principal():
     """
     Teclado principal.
@@ -647,107 +688,591 @@ def es_respuesta_exitosa_hercules(data: dict) -> bool:
         print(f"[ERROR] Analizando respuesta de Hércules: {e}")
         return False
 
+# =====================================================================
+# 9. GENERACIÓN DE INFORME VEHICULAR (PDF B7 v2)
+# =====================================================================
 
-def ejecutar_consulta_en_hilo(
-    chat_id: int,
-    usuario: Usuario,
-    mensaje_id: int,
-    tipo_consulta: int,
-    mensaje_parametro_str: str,
-    id_peticion: str,
-    formateador_respuesta,
-):
+def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/QuantumFBot") -> bytes:
     """
-    Hilo que hace polling a /resultados y decide si se cobra o no.
-    Ahora también permite que el formateador devuelva (texto, firma_b64)
-    para enviar la imagen de la firma en consultas tipo 8.
+    Genera el informe vehicular en PDF (plantilla B7 v2) en memoria
+    y devuelve los bytes del archivo.
     """
+    mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
+    info = json.loads(mensaje_raw)
 
-    def _run():
-        try:
-            deadline = time.time() + RESULTADOS_TIMEOUT
-            ultimo_data = None
+    # Soportar dos estructuras:
+    # 1) {"vehiculo": {"datos":..., "adicional":...}, "persona": {...}}
+    # 2) {"datos":..., "adicional":...} (solo vehículo)
+    vehiculo_info = info.get("vehiculo") or {}
+    if not vehiculo_info and isinstance(info, dict) and "datos" in info:
+        vehiculo_info = {
+            "datos": info.get("datos") or {},
+            "adicional": info.get("adicional") or {},
+        }
 
-            while time.time() < deadline:
-                data = llamar_resultados(id_peticion)
-                ultimo_data = data
+    datos_vehiculo = vehiculo_info.get("datos", {}) or {}
+    adicional = vehiculo_info.get("adicional", {}) or {}
 
-                tipo = data.get("Tipo")
-                if tipo is None:
-                    tipo = data.get("tipo")
+    persona_info = info.get("persona", {}) or {}
+    person = persona_info.get("person", {}) or {}
+    ubic_list = persona_info.get("ubicabilidad") or []
+    ubic = ubic_list[0] if ubic_list else {}
 
-                mensaje = data.get("Mensaje") or data.get("mensaje")
+    # ==========================
+    # 1. Datos vehículo
+    # ==========================
+    placa = datos_vehiculo.get("placaNumeroUnicoIdentificacion", "-")
+    clase = datos_vehiculo.get("claseVehiculo", "-")
+    servicio = datos_vehiculo.get("servicio", "-")
+    estado_registro = datos_vehiculo.get("estadoRegistroVehiculo", "-")
 
-                print(
-                    f"[DEBUG] Resultado parcial "
-                    f"(tipo={tipo_consulta}, mensaje='{mensaje_parametro_str}') -> "
-                    f"Tipo={tipo}, Mensaje={mensaje}"
-                )
+    marca = datos_vehiculo.get("marcaVehiculo", "-")
+    linea = datos_vehiculo.get("lineaVehiculo", "-")
+    modelo = datos_vehiculo.get("modelo", "-")
+    color = datos_vehiculo.get("color", "-")
+    carroceria = datos_vehiculo.get("carroceria", "-")
+    cilindraje = datos_vehiculo.get("cilindraje", "-")
 
-                # Tipo 2 -> procesando
-                if tipo == 2:
-                    time.sleep(RESULTADOS_INTERVALO)
-                    continue
+    nro_serie = "-"
+    vin = datos_vehiculo.get("vin", "-")
+    numero_motor = datos_vehiculo.get("numeroMotor", "-")
+    numero_chasis = datos_vehiculo.get("numeroChasis", "-")
 
-                # Tipo 0 / 1 -> respuesta final
-                break
+    importado = datos_vehiculo.get("origenRegistro", "-")
+    radio_accion = "-"
+    nivel_servicio = "-"
+    tipo_combustible = (
+        datos_vehiculo.get("tipoCombustible")
+        or datos_vehiculo.get("combustible")
+        or datos_vehiculo.get("tipoCombustibleVehiculo")
+        or "-"
+    )
+    estado_vehiculo = estado_registro
+    modalidad_servicio = "-"
 
-            if not ultimo_data:
-                marcar_mensaje_error_o_sin_datos(
-                    mensaje_id,
-                    estado="error",
-                    mensaje_error="Sin respuesta de resultados (timeout).",
-                )
-                enviar_mensaje(chat_id, textos.MENSAJE_ERROR_GENERICO)
-                return
+    regrab_motor = "-"
+    regrab_chasis = "-"
+    regrab_serie = "-"
+    regrab_vin = "-"
 
-            if es_respuesta_exitosa_hercules(ultimo_data):
-                marcar_mensaje_exito_y_cobrar(mensaje_id, ultimo_data)
+    tiene_gravamen = datos_vehiculo.get("poseeGravamenes", "-")
+    vehiculo_rematado = "-"
+    medidas_cautelares = "-"
 
-                # formateador puede devolver:
-                #  - solo texto (str)
-                #  - (texto, firma_b64)
-                resultado_formateo = formateador_respuesta(ultimo_data)
+    transmision = datos_vehiculo.get("tipoTransmision", "-")
+    traccion = datos_vehiculo.get("tipoTraccion", "-")
+    nivel_emisiones = datos_vehiculo.get("nivelEmisiones", "-")
 
-                texto_respuesta = textos.MENSAJE_ERROR_GENERICO
-                firma_b64 = None
+    aspiracion = datos_vehiculo.get("tipoAspiracion", "-")
+    freno = datos_vehiculo.get("tipoFreno", "-")
 
-                if isinstance(resultado_formateo, tuple):
-                    if len(resultado_formateo) >= 1:
-                        texto_respuesta = resultado_formateo[0]
-                    if len(resultado_formateo) >= 2:
-                        firma_b64 = resultado_formateo[1]
-                else:
-                    texto_respuesta = resultado_formateo
+    info_veh_dto = adicional.get("informacionVehiculoDTO", {}) or {}
+    blindado = info_veh_dto.get("blindado", "-")
 
-                enviar_mensaje(chat_id, texto_respuesta)
+    # ==========================
+    # 2. Propietario
+    # ==========================
+    nombre_prop = " ".join(
+        [
+            person.get("nombre1", ""),
+            person.get("nombre2", ""),
+            person.get("apellido1", ""),
+            person.get("apellido2", ""),
+        ]
+    ).strip() or "-"
 
-                # Si hay firma en base64, la enviamos como documento
-                if firma_b64:
-                    enviar_documento_firma_desde_b64(chat_id, firma_b64)
+    prop_tipo_doc = person.get("idTipoDoc") or person.get("tipoDocumento") or "-"
+    prop_num_doc = person.get("nroDocumento") or person.get("numeroDocumento") or "-"
 
-            else:
-                marcar_mensaje_error_o_sin_datos(
-                    mensaje_id,
-                    estado="sin_datos",
-                    mensaje_error="Consulta sin datos o no exitosa.",
-                    respuesta_bruta=ultimo_data,
-                )
-                enviar_mensaje(chat_id, textos.MENSAJE_SIN_DATOS)
+    direccion = ubic.get("direccion", "-")
+    municipio_raw = ubic.get("municipio", "") or "-"
+    if " - " in municipio_raw:
+        ciudad, departamento = [x.strip() for x in municipio_raw.split(" - ", 1)]
+    else:
+        ciudad = municipio_raw
+        departamento = "-"
 
-        except Exception as e:
-            print(f"[ERROR] ejecutando consulta en hilo: {e}")
-            marcar_mensaje_error_o_sin_datos(
-                mensaje_id,
-                estado="error",
-                mensaje_error=str(e),
+    telefono = ubic.get("telefono") or person.get("celular") or "-"
+    correo = ubic.get("correoElectronico") or person.get("email") or "-"
+
+    # ==========================
+    # 3. Licencias
+    # ==========================
+    licencias_list = []
+    lista_comparendos = adicional.get("listaComparendos") or []
+    if lista_comparendos:
+        comp = lista_comparendos[0]
+        for lic in comp.get("listaLicencias") or []:
+            licencias_list.append(
+                {
+                    "numero": lic.get("numeroLicencia", "") or "",
+                    "categoria": lic.get("categoria", "") or "",
+                    "fechaExpedicion": lic.get("fechaExpedicion", "") or "",
+                    "fechaVencimiento": lic.get("fechaVencimiento", "") or "",
+                    "estado": lic.get("estado", "") or "",
+                }
             )
-            enviar_mensaje(chat_id, textos.MENSAJE_ERROR_GENERICO)
 
-    threading.Thread(target=_run, daemon=True).start()
+    # ==========================
+    # 4. SOAT y RTM
+    # ==========================
+    lista_polizas = adicional.get("listaPolizas") or []
+    soat_list = [
+        p for p in lista_polizas
+        if (p.get("tipoPoliza", "") or "").upper() == "SOAT"
+    ]
+
+    def calcular_vigente(fecha_str, formato="%d/%m/%Y"):
+        try:
+            fecha = datetime.strptime(fecha_str, formato).date()
+            hoy = datetime.now().date()
+            return "SI" if fecha >= hoy else "NO"
+        except Exception:
+            return "-"
+
+    soat_vigente = "SI" if any(
+        calcular_vigente(p.get("fechaVencimiento", "")) == "SI" for p in soat_list
+    ) else "NO"
+
+    rtm_list = adicional.get("listaRtm") or []
+    rtm_vigente = "SI" if any(
+        calcular_vigente(r.get("fechaVigencia", "")) == "SI" for r in rtm_list
+    ) else "NO"
+
+    inscrito_runt = datos_vehiculo.get("vehiculoInscritoRUNT", "-")
+    gravamenes = datos_vehiculo.get("poseeGravamenes", "-")
+    tarjeta_servicios = datos_vehiculo.get("numeroTarjetaServicios", "-")
+    tarjeta_vence = datos_vehiculo.get("fechaVencimientoTarjetaServicios", "-") or "-"
+
+    # ==========================
+    # 5. Estilos ReportLab
+    # ==========================
+    styles = getSampleStyleSheet()
+
+    section_title_style = ParagraphStyle(
+        name="SectionTitle",
+        parent=styles["Heading2"],
+        fontName="Helvetica-Bold",
+        fontSize=12,
+        textColor=colors.HexColor("#003366"),
+        spaceBefore=6,
+        spaceAfter=4,
+    )
+    normal_style = styles["Normal"]
+    normal_style.fontSize = 9
+
+    small_style = ParagraphStyle(
+        name="Small",
+        parent=styles["Normal"],
+        fontSize=8,
+    )
+
+    def cell(t):
+        return Paragraph(str(t if t is not None else "-"), normal_style)
+
+    def cell_small(t):
+        return Paragraph(str(t if t is not None else "-"), small_style)
+
+    # ==========================
+    # 6. QR en imagen temporal
+    # ==========================
+    qr_path = "qr_temp_informe_vehicular.png"
+    qr_obj = qrcode.QRCode(box_size=8, border=1)
+    qr_obj.add_data(qr_url)
+    qr_obj.make(fit=True)
+    img = qr_obj.make_image(fill_color="black", back_color="white")
+    img.save(qr_path)
+
+    # ==========================
+    # 7. Construir PDF en memoria
+    # ==========================
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=20 * mm,
+        rightMargin=20 * mm,
+        topMargin=45 * mm,
+        bottomMargin=15 * mm,
+    )
+    total_width = doc.width
+    story = []
+
+    # ---------- 1. Datos principales ----------
+    story.append(Paragraph("1. Datos principales del vehículo", section_title_style))
+    tabla_datos_principales = Table(
+        [
+            [cell("Placa"), cell(placa), cell("Clase"), cell(clase)],
+            [cell("Servicio"), cell(servicio), cell("Estado del registro"), cell(estado_registro)],
+        ],
+        colWidths=[total_width / 4] * 4,
+    )
+    tabla_datos_principales.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EEEEEE")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#003366")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+            ]
+        )
+    )
+    story.append(tabla_datos_principales)
+    story.append(Spacer(1, 6))
+
+    # ---------- 2. Información de propietario ----------
+    story.append(Paragraph("2. Información de propietario", section_title_style))
+
+    tabla_propietario = Table(
+        [
+            [cell("Nombre / Razón social"), cell(nombre_prop)],
+            [cell("Tipo y número de documento"), cell(f"{prop_tipo_doc} {prop_num_doc}")],
+        ],
+        colWidths=[total_width / 2, total_width / 2],
+    )
+    tabla_propietario.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F5F5F5")),
+                ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#003366")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+            ]
+        )
+    )
+    story.append(tabla_propietario)
+    story.append(Spacer(1, 4))
+
+    tabla_ubicacion = Table(
+        [
+            [cell("Departamento"), cell(departamento), cell("Ciudad"), cell(ciudad)],
+            [cell("Dirección"), cell(direccion), cell("Teléfono"), cell(telefono)],
+            [cell("Correo"), cell(correo), cell(""), cell("")],
+        ],
+        colWidths=[total_width / 4] * 4,
+    )
+    tabla_ubicacion.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EEEEEE")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#003366")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+            ]
+        )
+    )
+    story.append(tabla_ubicacion)
+    story.append(Spacer(1, 4))
+
+    # Licencias solo si existen
+    if licencias_list:
+        tabla_lic_title = Table(
+            [[Paragraph("<b>LICENCIAS DE CONDUCCIÓN</b>", normal_style)]],
+            colWidths=[total_width],
+        )
+        tabla_lic_title.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#DDDDDD")),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("BOX", (0, 0), (-1, -1), 0.5, colors.black),
+                ]
+            )
+        )
+        story.append(tabla_lic_title)
+
+        lic_header = [
+            cell_small("No. licencia"),
+            cell_small("Categoría"),
+            cell_small("Fecha expedición"),
+            cell_small("Fecha vencimiento"),
+            cell_small("Estado"),
+        ]
+        lic_rows = [lic_header]
+        for lic in licencias_list:
+            lic_rows.append(
+                [
+                    cell_small(lic["numero"]),
+                    cell_small(lic["categoria"]),
+                    cell_small(lic["fechaExpedicion"]),
+                    cell_small(lic["fechaVencimiento"]),
+                    cell_small(lic["estado"]),
+                ]
+            )
+        tabla_lic = Table(
+            lic_rows,
+            colWidths[
+                :
+            ] if False else [
+                total_width * 0.18,
+                total_width * 0.12,
+                total_width * 0.20,
+                total_width * 0.20,
+                total_width * 0.30,
+            ],
+        )
+        tabla_lic.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F5F5F5")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#003366")),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.black),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ]
+            )
+        )
+        story.append(tabla_lic)
+        story.append(Spacer(1, 6))
+
+    # ---------- 3. Características del vehículo ----------
+    story.append(Paragraph("3. Características del vehículo", section_title_style))
+    tabla_caracteristicas = Table(
+        [
+            [cell("Marca"), cell(marca), cell("Modelo"), cell(modelo)],
+            [cell("Línea"), cell(linea), cell("Clase"), cell(clase)],
+            [cell("Color"), cell(color), cell("Carrocería"), cell(carroceria)],
+            [cell("Cilindraje"), cell(cilindraje), cell("Tipo de combustible"), cell(tipo_combustible)],
+            [cell("Nro. Serie"), cell(nro_serie), cell("Nro. VIN"), cell(vin)],
+            [cell("Nro. Motor"), cell(numero_motor), cell("Nro. Chasis"), cell(numero_chasis)],
+            [cell("Importado"), cell(importado), cell("Radio acción"), cell(radio_accion)],
+            [cell("Nivel servicio"), cell(nivel_servicio), cell("Transmisión"), cell(transmision)],
+            [cell("Tracción"), cell(traccion), cell("Nivel de emisiones"), cell(nivel_emisiones)],
+            [cell("Estado del vehículo"), cell(estado_vehiculo), cell("Modalidad servicio"), cell(modalidad_servicio)],
+            [cell("Regrabación motor"), cell(regrab_motor), cell("Regrabación chasis"), cell(regrab_chasis)],
+            [cell("Regrabación serie"), cell(regrab_serie), cell("Regrabación VIN"), cell(regrab_vin)],
+            [cell("Tiene gravamen"), cell(tiene_gravamen), cell("Vehículo rematado"), cell(vehiculo_rematado)],
+            [cell("Tiene medidas cautelares"), cell(medidas_cautelares), cell(""), cell("")],
+        ],
+        colWidths=[total_width / 4] * 4,
+    )
+    tabla_caracteristicas.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EEEEEE")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#003366")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+            ]
+        )
+    )
+    story.append(tabla_caracteristicas)
+    story.append(Spacer(1, 6))
+
+    # ---------- Forzar sección 4 a nueva página ----------
+    story.append(PageBreak())
+
+    # ---------- 4. Estado de documentos y seguridad ----------
+    story.append(Paragraph("4. Estado de documentos y seguridad", section_title_style))
+    tabla_docs_resumen = Table(
+        [
+            [cell("Inscrito en RUNT"), cell(inscrito_runt), cell("Gravámenes"), cell(gravamenes)],
+            [cell("Tarjeta de servicios"), cell(tarjeta_servicios), cell("Vigencia tarjeta"), cell(tarjeta_vence)],
+            [cell("SOAT vigente"), cell(soat_vigente), cell("RTM vigente"), cell(rtm_vigente)],
+        ],
+        colWidths=[total_width / 4] * 4,
+    )
+    tabla_docs_resumen.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EEEEEE")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#003366")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+            ]
+        )
+    )
+    story.append(tabla_docs_resumen)
+    story.append(Spacer(1, 4))
+
+    if soat_list:
+        tabla_soat_title = Table(
+            [[Paragraph("<b>SOAT</b>", normal_style)]],
+            colWidths=[total_width],
+        )
+        tabla_soat_title.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#DDDDDD")),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("BOX", (0, 0), (-1, -1), 0.5, colors.black),
+                ]
+            )
+        )
+        story.append(tabla_soat_title)
+
+        soat_header = [
+            cell_small("No. Póliza"),
+            cell_small("Fecha inicio vigencia"),
+            cell_small("Fecha fin vigencia"),
+            cell_small("Entidad que expide SOAT"),
+            cell_small("Vigente"),
+        ]
+        soat_rows = [soat_header]
+        for pol in soat_list:
+            soat_rows.append(
+                [
+                    cell_small(pol.get("numeroPoliza", "-")),
+                    cell_small(pol.get("fechaInicio", "-")),
+                    cell_small(pol.get("fechaVencimiento", "-")),
+                    cell_small(pol.get("aseguradora", "-")),
+                    cell_small(calcular_vigente(pol.get("fechaVencimiento", "-"))),
+                ]
+            )
+        tabla_soat = Table(
+            soat_rows,
+            colWidths=[
+                total_width * 0.20,
+                total_width * 0.16,
+                total_width * 0.16,
+                total_width * 0.33,
+                total_width * 0.15,
+            ],
+        )
+        tabla_soat.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F5F5F5")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#003366")),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.black),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ]
+            )
+        )
+        story.append(tabla_soat)
+        story.append(Spacer(1, 4))
+
+    if rtm_list:
+        tabla_rtm_title = Table(
+            [[Paragraph("<b>REVISIÓN TÉCNICO MECÁNICA</b>", normal_style)]],
+            colWidths=[total_width],
+        )
+        tabla_rtm_title.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#DDDDDD")),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("BOX", (0, 0), (-1, -1), 0.5, colors.black),
+                ]
+            )
+        )
+        story.append(tabla_rtm_title)
+
+        rtm_header = [
+            cell_small("Tipo de revisión"),
+            cell_small("Fecha expedición"),
+            cell_small("Fecha vigencia"),
+            cell_small("CDA expide RTM"),
+            cell_small("Vigente"),
+        ]
+        rtm_rows = [rtm_header]
+        for r in rtm_list:
+            rtm_rows.append(
+                [
+                    cell_small(r.get("tipoRevision", "-")),
+                    cell_small(r.get("fechaExpedicion", "-")),
+                    cell_small(r.get("fechaVigencia", "-")),
+                    cell_small(r.get("nombreCda", "-")),
+                    cell_small(calcular_vigente(r.get("fechaVigencia", "-"))),
+                ]
+            )
+        tabla_rtm = Table(
+            rtm_rows,
+            colWidths=[
+                total_width * 0.25,
+                total_width * 0.18,
+                total_width * 0.18,
+                total_width * 0.24,
+                total_width * 0.15,
+            ],
+        )
+        tabla_rtm.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F5F5F5")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#003366")),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.black),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ]
+            )
+        )
+        story.append(tabla_rtm)
+        story.append(Spacer(1, 6))
+
+    # ---------- 5. Información adicional ----------
+    story.append(Paragraph("5. Información adicional del vehículo", section_title_style))
+    tabla_extra = Table(
+        [
+            [cell("Aspiración"), cell(aspiracion)],
+            [cell("Tipo de freno"), cell(freno)],
+            [cell("Blindado"), cell(blindado)],
+        ],
+        colWidths=[total_width / 3, total_width * 2 / 3],
+    )
+    tabla_extra.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F5F5F5")),
+                ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#003366")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+            ]
+        )
+    )
+    story.append(tabla_extra)
+    story.append(Spacer(1, 10))
+
+    disclaimer = Paragraph(
+        "<font size='7' color='#555555'>Este informe es generado por un sistema interno de consultas "
+        "y no sustituye documentos oficiales de tránsito ni certificados expedidos por autoridades competentes.</font>",
+        styles["Normal"],
+    )
+    story.append(disclaimer)
+
+    # ==========================
+    # 8. Encabezado y pie
+    # ==========================
+    def draw_header_and_footer(canvas, doc_obj):
+        canvas.saveState()
+        page_width, page_height = doc_obj.pagesize
+        left = doc_obj.leftMargin
+        top_margin = doc_obj.topMargin
+        frame_top = page_height - top_margin
+
+        title_y = frame_top + 10 * mm
+        subtitle_y = frame_top + 4 * mm
+        date_y = subtitle_y - 3 * mm
+
+        canvas.setFont("Helvetica-Bold", 18)
+        canvas.setFillColor(colors.HexColor("#003366"))
+        canvas.drawString(left, title_y, "INFORME VEHICULAR")
+
+        canvas.setFont("Helvetica", 9)
+        canvas.setFillColor(colors.HexColor("#555555"))
+        canvas.drawString(left, subtitle_y, "Reporte generado por sistema de consultas Hércules")
+
+        fecha_text = f"Fecha de emisión: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        canvas.setFont("Helvetica", 8)
+        text_width = canvas.stringWidth(fecha_text, "Helvetica", 8)
+        canvas.drawString(page_width - doc_obj.rightMargin - text_width, date_y, fecha_text)
+
+        qr_size = 30 * mm
+        qr_x = page_width - doc_obj.rightMargin - qr_size
+        qr_y = frame_top + 5 * mm
+        canvas.drawImage(qr_path, qr_x, qr_y, qr_size, qr_size, preserveAspectRatio=True, mask="auto")
+
+        canvas.setStrokeColor(colors.HexColor("#003366"))
+        canvas.setLineWidth(1)
+        canvas.line(doc_obj.leftMargin, frame_top, page_width - doc_obj.rightMargin, frame_top)
+
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(colors.black)
+        page_num = canvas.getPageNumber()
+        canvas.drawCentredString(page_width / 2.0, 10 * mm, f"Página {page_num}")
+
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=draw_header_and_footer, onLaterPages=draw_header_and_footer)
+
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
 
 # =====================================================================
-# 9. FORMATEADORES DE RESPUESTA
+# 10. FORMATEADORES DE RESPUESTA (TEXTO TELEGRAM)
 # =====================================================================
 
 def formatear_respuesta_firma(data: dict):
@@ -891,16 +1416,11 @@ def formatear_respuesta_persona(data: dict) -> str:
 
 def formatear_respuesta_vehiculo(data: dict) -> str:
     """
-    Formatea la respuesta de vehículo para mostrarla en Telegram.
-
-    Soporta estas estructuras de Mensaje:
-      1) {"vehiculo": {"datos": {...}, "adicional": {...}}}
-      2) {"datos": {...}, "adicional": {...}}
-      3) {"placaNumeroUnicoIdentificacion": "...", ...} (campos en la raíz)
+    Formatea la respuesta de vehículo para mostrarla en Telegram
+    con un resumen profesional y compacto.
     """
     try:
         mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
-
         print(f"[DEBUG] formatear_respuesta_vehiculo.mensaje_raw (tipo={type(mensaje_raw)}): {mensaje_raw}")
 
         info = {}
@@ -924,19 +1444,24 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
 
         print(f"[DEBUG] formatear_respuesta_vehiculo.info (tipo={type(info)}): {info}")
 
+        # Detectar estructura de datos del vehículo
         datos = {}
+        adicional = {}
 
         if isinstance(info, dict) and "datos" in info and isinstance(info["datos"], dict):
             datos = info["datos"]
+            adicional = info.get("adicional") or {}
             print("[DEBUG] formatear_respuesta_vehiculo: usando info['datos']")
         else:
             veh = info.get("vehiculo")
             if isinstance(veh, dict):
                 if "datos" in veh and isinstance(veh["datos"], dict):
                     datos = veh["datos"]
+                    adicional = veh.get("adicional") or {}
                     print("[DEBUG] formatear_respuesta_vehiculo: usando info['vehiculo']['datos']")
                 else:
                     datos = veh
+                    adicional = info.get("adicional") or {}
                     print("[DEBUG] formatear_respuesta_vehiculo: usando info['vehiculo'] directo")
             else:
                 if any(
@@ -949,35 +1474,165 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
                     )
                 ):
                     datos = info
+                    adicional = info.get("adicional") or {}
                     print("[DEBUG] formatear_respuesta_vehiculo: usando info directo (campos en raíz)")
                 else:
                     print("[DEBUG] formatear_respuesta_vehiculo: no se encontró 'datos' ni 'vehiculo' adecuados")
 
         datos = datos or {}
         print(f"[DEBUG] formatear_respuesta_vehiculo.datos: {datos}")
+        print(f"[DEBUG] formatear_respuesta_vehiculo.adicional: {adicional}")
 
         placa = (
             datos.get("placaNumeroUnicoIdentificacion")
             or datos.get("placa")
             or "-"
         )
+        clase = datos.get("claseVehiculo") or "-"
         marca = datos.get("marcaVehiculo") or "-"
         linea = datos.get("lineaVehiculo") or "-"
         modelo = datos.get("modelo") or "-"
         color = datos.get("color") or "-"
+        carroceria = datos.get("carroceria") or "-"
+        cilindraje = datos.get("cilindraje") or "-"
         servicio = datos.get("servicio") or "-"
-        clase = datos.get("claseVehiculo") or "-"
+        estado_registro = datos.get("estadoRegistroVehiculo") or "-"
+        numero_motor = datos.get("numeroMotor") or "-"
+        numero_chasis = datos.get("numeroChasis") or "-"
+        vin = datos.get("vin") or "-"
+        inscrito_runt = datos.get("vehiculoInscritoRUNT", "-")
+        gravamenes = datos.get("poseeGravamenes", "-")
 
-        return (
-            "🚗 *Información del vehículo*\n\n"
-            f"*Placa:* {placa}\n"
-            f"*Marca:* {marca}\n"
-            f"*Línea:* {linea}\n"
-            f"*Modelo:* {modelo}\n"
-            f"*Color:* {color}\n"
-            f"*Clase:* {clase}\n"
-            f"*Servicio:* {servicio}\n"
+        tipo_combustible = (
+            datos.get("tipoCombustible")
+            or datos.get("combustible")
+            or datos.get("tipoCombustibleVehiculo")
+            or "-"
         )
+
+        # SOAT / RTM
+        lista_polizas = adicional.get("listaPolizas") or []
+        soat_list = [
+            p for p in lista_polizas
+            if (p.get("tipoPoliza", "") or "").upper() == "SOAT"
+        ]
+
+        lista_rtm = adicional.get("listaRtm") or []
+
+        def calcular_vigente(fecha_str, formato="%d/%m/%Y"):
+            try:
+                fecha = datetime.strptime(fecha_str, formato).date()
+                hoy = datetime.now().date()
+                return "SI" if fecha >= hoy else "NO"
+            except Exception:
+                return "-"
+
+        soat_vigente = "SI" if any(
+            calcular_vigente(p.get("fechaVencimiento", "")) == "SI"
+            for p in soat_list
+        ) else "NO"
+        rtm_vigente = "SI" if any(
+            calcular_vigente(r.get("fechaVigencia", "")) == "SI"
+            for r in lista_rtm
+        ) else "NO"
+
+        # Últimas póliza y RTM (si existen)
+        ultima_poliza = soat_list[0] if soat_list else None
+        ultima_rtm = lista_rtm[0] if lista_rtm else None
+
+        # Propietario (si viene en el mismo JSON con persona)
+        nombre_prop = "-"
+        tipo_doc_prop = "-"
+        nro_doc_prop = "-"
+
+        persona_info = info.get("persona") or {}
+        person = persona_info.get("person") or {}
+        if person:
+            nombre_prop = " ".join(
+                [
+                    person.get("nombre1", ""),
+                    person.get("nombre2", ""),
+                    person.get("apellido1", ""),
+                    person.get("apellido2", ""),
+                ]
+            ).strip() or "-"
+            tipo_doc_prop = person.get("idTipoDoc") or person.get("tipoDocumento") or "-"
+            nro_doc_prop = person.get("nroDocumento") or person.get("numeroDocumento") or "-"
+
+        # Accidentes y licencias
+        lista_accidentes = adicional.get("listaAccidentes") or []
+        accidentes_count = len(lista_accidentes)
+
+        licencias_list = []
+        lista_comparendos = adicional.get("listaComparendos") or []
+        if lista_comparendos:
+            comp = lista_comparendos[0]
+            for lic in comp.get("listaLicencias") or []:
+                licencias_list.append(
+                    {
+                        "numero": lic.get("numeroLicencia", "") or "",
+                        "categoria": lic.get("categoria", "") or "",
+                        "estado": lic.get("estado", "") or "",
+                    }
+                )
+
+        # Mensaje final
+        partes = []
+
+        partes.append(f"🚗 *Informe vehicular – {placa}*")
+        partes.append("")
+        partes.append("*1. Datos principales*")
+        partes.append(f"• Placa: `{placa}`")
+        partes.append(f"• Clase: {clase}")
+        partes.append(f"• Servicio: {servicio}")
+        partes.append(f"• Estado del registro: {estado_registro}")
+        partes.append("")
+        partes.append("*2. Características del vehículo*")
+        partes.append(f"• Marca / Línea / Modelo: {marca} {linea} {modelo}")
+        partes.append(f"• Color / Carrocería: {color} / {carroceria}")
+        partes.append(f"• Cilindraje: {cilindraje} cc")
+        partes.append(f"• Tipo de combustible: {tipo_combustible}")
+        partes.append(f"• Motor: {numero_motor}")
+        partes.append(f"• Chasis / VIN: {numero_chasis} / {vin}")
+        partes.append("")
+        partes.append("*3. Estado de documentos y seguridad*")
+        partes.append(f"• Inscrito en RUNT: {inscrito_runt}")
+        partes.append(f"• Posee gravámenes: {gravamenes}")
+        partes.append(f"• SOAT vigente: {soat_vigente}")
+        if ultima_poliza:
+            partes.append(
+                f"  └ Última póliza: {ultima_poliza.get('numeroPoliza','-')} – {ultima_poliza.get('aseguradora','-')}"
+            )
+            partes.append(
+                f"    Vigencia: {ultima_poliza.get('fechaInicio','-')} a {ultima_poliza.get('fechaVencimiento','-')}"
+            )
+        partes.append(f"• RTM vigente: {rtm_vigente}")
+        if ultima_rtm:
+            partes.append(
+                f"  └ Última revisión: {ultima_rtm.get('tipoRevision','-')} – {ultima_rtm.get('nombreCda','-')}"
+            )
+            partes.append(
+                f"    Vigencia: {ultima_rtm.get('fechaExpedicion','-')} a {ultima_rtm.get('fechaVigencia','-')}"
+            )
+
+        if nombre_prop != "-" or nro_doc_prop != "-":
+            partes.append("")
+            partes.append("*4. Propietario*")
+            partes.append(f"• Nombre: {nombre_prop}")
+            partes.append(f"• Documento: {tipo_doc_prop} {nro_doc_prop}")
+
+        partes.append("")
+        partes.append("*5. Resumen adicional*")
+        partes.append(f"• Blindado: {info.get('adicional', {}).get('informacionVehiculoDTO', {}).get('blindado', '-') if isinstance(info.get('adicional'), dict) else '-'}")
+        partes.append(f"• Accidentes reportados: {accidentes_count}")
+        if licencias_list:
+            partes.append("• Licencia(s) de conducción asociada(s):")
+            for lic in licencias_list:
+                partes.append(
+                    f"  └ No. {lic['numero']} – Categoría {lic['categoria']} – Estado: {lic['estado']}"
+                )
+
+        return "\n".join(partes)
 
     except Exception as e:
         print(f"[ERROR] formateando vehículo: {e}")
@@ -1022,7 +1677,7 @@ def formatear_respuesta_propietario(data: dict) -> str:
         return textos.MENSAJE_ERROR_GENERICO
 
 # =====================================================================
-# 10. LÓGICA DE NEGOCIO: INICIAR CONSULTAS
+# 11. LÓGICA DE NEGOCIO: INICIAR CONSULTAS
 # =====================================================================
 
 def _verificar_creditos_o_mensaje(chat_id: int, usuario: Usuario, config: ConsultaConfig) -> bool:
@@ -1199,7 +1854,133 @@ def iniciar_consulta_propietario(usuario: Usuario, chat_id: int, placa: str):
     )
 
 # =====================================================================
-# 11. FLASK + WEBHOOK TELEGRAM
+# 12. EJECUCIÓN EN HILO Y ENVÍO DE PDF
+# =====================================================================
+
+def ejecutar_consulta_en_hilo(
+    chat_id: int,
+    usuario: Usuario,
+    mensaje_id: int,
+    tipo_consulta: int,
+    mensaje_parametro_str: str,
+    id_peticion: str,
+    formateador_respuesta,
+):
+    """
+    Hilo que hace polling a /resultados y decide si se cobra o no.
+    Ahora también permite que, en caso de consulta de vehículo,
+    se genere y envíe un PDF con el informe vehicular.
+    """
+
+    def _run():
+        try:
+            deadline = time.time() + RESULTADOS_TIMEOUT
+            ultimo_data = None
+
+            while time.time() < deadline:
+                data = llamar_resultados(id_peticion)
+                ultimo_data = data
+
+                tipo = data.get("Tipo")
+                if tipo is None:
+                    tipo = data.get("tipo")
+
+                mensaje = data.get("Mensaje") or data.get("mensaje")
+
+                print(
+                    f"[DEBUG] Resultado parcial "
+                    f"(tipo={tipo_consulta}, mensaje='{mensaje_parametro_str}') -> "
+                    f"Tipo={tipo}, Mensaje={mensaje}"
+                )
+
+                # Tipo 2 -> procesando
+                if tipo == 2:
+                    time.sleep(RESULTADOS_INTERVALO)
+                    continue
+
+                # Tipo 0 / 1 -> respuesta final
+                break
+
+            if not ultimo_data:
+                marcar_mensaje_error_o_sin_datos(
+                    mensaje_id,
+                    estado="error",
+                    mensaje_error="Sin respuesta de resultados (timeout).",
+                )
+                enviar_mensaje(chat_id, textos.MENSAJE_ERROR_GENERICO)
+                return
+
+            if es_respuesta_exitosa_hercules(ultimo_data):
+                marcar_mensaje_exito_y_cobrar(mensaje_id, ultimo_data)
+
+                # formateador puede devolver:
+                #  - solo texto (str)
+                #  - (texto, firma_b64) en el caso de firma
+                resultado_formateo = formateador_respuesta(ultimo_data)
+
+                texto_respuesta = textos.MENSAJE_ERROR_GENERICO
+                firma_b64 = None
+
+                if isinstance(resultado_formateo, tuple):
+                    if len(resultado_formateo) >= 1:
+                        texto_respuesta = resultado_formateo[0]
+                    if len(resultado_formateo) >= 2:
+                        firma_b64 = resultado_formateo[1]
+                else:
+                    texto_respuesta = resultado_formateo
+
+                enviar_mensaje(chat_id, texto_respuesta)
+
+                # Si hay firma en base64, la enviamos como documento
+                if firma_b64:
+                    enviar_documento_firma_desde_b64(chat_id, firma_b64)
+
+                # === NUEVO: si es consulta de vehículo, generamos y enviamos PDF ===
+                if tipo_consulta == TIPO_CONSULTA_VEHICULO_SOLO:
+                    try:
+                        # Intentamos extraer la placa para usarla en el nombre del archivo
+                        placa_para_nombre = "VEHICULO"
+                        try:
+                            mensaje_str_local = ultimo_data.get("Mensaje") or ultimo_data.get("mensaje") or ""
+                            info_local = json.loads(mensaje_str_local)
+                            # Soportar estructuras con 'vehiculo' o con 'datos' en la raíz
+                            veh_local = info_local.get("vehiculo") or {}
+                            if not veh_local and "datos" in info_local:
+                                datos_local = info_local.get("datos") or {}
+                            else:
+                                datos_local = (veh_local.get("datos") or veh_local) if veh_local else {}
+                            placa_para_nombre = datos_local.get("placaNumeroUnicoIdentificacion", "VEHICULO")
+                        except Exception as e:
+                            print(f"[WARN] No se pudo extraer placa para nombre de PDF: {e}")
+
+                        pdf_bytes = generar_informe_vehicular_B7_v2(ultimo_data)
+                        nombre_pdf = f"Informe_vehicular_{placa_para_nombre}.pdf"
+                        enviar_documento_pdf(chat_id, nombre_pdf, pdf_bytes)
+                    except Exception as e:
+                        print(f"[ERROR] generando/enviando PDF vehicular: {e}")
+
+            else:
+                marcar_mensaje_error_o_sin_datos(
+                    mensaje_id,
+                    estado="sin_datos",
+                    mensaje_error="Consulta sin datos o no exitosa.",
+                    respuesta_bruta=ultimo_data,
+                )
+                enviar_mensaje(chat_id, textos.MENSAJE_SIN_DATOS)
+
+        except Exception as e:
+            print(f"[ERROR] ejecutando consulta en hilo: {e}")
+            marcar_mensaje_error_o_sin_datos(
+                mensaje_id,
+                estado="error",
+                mensaje_error=str(e),
+            )
+            enviar_mensaje(chat_id, textos.MENSAJE_ERROR_GENERICO)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+# =====================================================================
+# 13. FLASK + WEBHOOK TELEGRAM
 # =====================================================================
 
 app = Flask(__name__)

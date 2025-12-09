@@ -4,3 +4,7 @@ gunicorn
 SQLAlchemy
 pymysql
 cryptography
+reportlab
+qrcode
+Pillow
+
