@@ -4,7 +4,6 @@ import time
 import threading
 from datetime import datetime
 from typing import Optional, Dict, Any
-import re  # 👈 añadido para limpiar escapes inválidos
 
 import requests
 from flask import Flask, request, jsonify
@@ -465,22 +464,28 @@ def get_user_state(chat_id: int) -> Dict[str, Any]:
 # 8. LLAMADAS A LA API HÉRCULES
 # =====================================================================
 
-def llamar_iniciar_consulta(tipo_consulta: int, mensaje_payload: Dict[str, Any]) -> str:
+def llamar_iniciar_consulta(tipo_consulta: int, mensaje_payload: Any) -> str:
     """
     Llama a POST /api/IniciarConsulta y devuelve el IdPeticion.
 
-    Soporta dos formatos de respuesta:
+    Formatos de respuesta soportados:
 
-    1) Formato NUEVO (el que estás recibiendo ahora):
+    1) Formato NUEVO:
        { "IdPeticion": "guid..." }
 
-    2) Formato ANTIGUO (por si algún día lo vuelven a usar):
+    2) Formato ANTIGUO:
        { "Tipo": 0, "Mensaje": "guid..." }
+
+    Además:
+      - Si mensaje_payload es dict/list -> se serializa a JSON.
+      - Si mensaje_payload es str -> se manda tal cual (sin json.dumps).
     """
     url = f"{API_BASE}/api/IniciarConsulta"
 
-    # La API espera que 'mensaje' sea un string con JSON interno
-    mensaje_str = json.dumps(mensaje_payload, ensure_ascii=False)
+    if isinstance(mensaje_payload, (dict, list)):
+        mensaje_str = json.dumps(mensaje_payload, ensure_ascii=False)
+    else:
+        mensaje_str = str(mensaje_payload)
 
     body = {
         "token": HERCULES_TOKEN,
@@ -492,7 +497,6 @@ def llamar_iniciar_consulta(tipo_consulta: int, mensaje_payload: Dict[str, Any])
 
     resp = requests.post(url, json=body, timeout=30)
 
-    # Si el HTTP no es 200, lanzamos error y lo vemos en logs
     try:
         resp.raise_for_status()
     except Exception:
@@ -502,12 +506,12 @@ def llamar_iniciar_consulta(tipo_consulta: int, mensaje_payload: Dict[str, Any])
     data = resp.json()
     print(f"[DEBUG] Respuesta IniciarConsulta: {data}")
 
-    # ------- FORMATO NUEVO: { "IdPeticion": "..." } -------
+    # Formato NUEVO
     id_peticion = data.get("IdPeticion") or data.get("idPeticion")
     if id_peticion:
         return str(id_peticion)
 
-    # ------- FORMATO ANTIGUO: { "Tipo": 0, "Mensaje": "..." } -------
+    # Formato ANTIGUO
     tipo = data.get("Tipo")
     if tipo is None:
         tipo = data.get("tipo")
@@ -517,7 +521,6 @@ def llamar_iniciar_consulta(tipo_consulta: int, mensaje_payload: Dict[str, Any])
     if tipo == 0 and mensaje:
         return str(mensaje)
 
-    # Si no encaja en ninguno de los formatos, lanzamos error
     raise RuntimeError(f"Respuesta no esperada de IniciarConsulta: {data}")
 
 
@@ -525,7 +528,7 @@ def llamar_resultados(id_peticion: str) -> dict:
     """
     Llama a GET /api/resultados/{token}/{idPeticion}
     Respuesta esperada:
-      { "Tipo": 0|1|2, "Mensaje": "..." }  (según ejemplos).
+      { "Tipo": 0|1|2, "Mensaje": "..." }
     """
     url = f"{API_BASE}/api/resultados/{HERCULES_TOKEN}/{id_peticion}"
 
@@ -538,47 +541,6 @@ def llamar_resultados(id_peticion: str) -> dict:
     print(f"[DEBUG] Respuesta Resultados: {data}")
     return data
 
-# =====================================================================
-# 8.1 PARSER TOLERANTE PARA MENSAJE (JSON CON ESCAPES RAROS)
-# =====================================================================
-
-def parsear_mensaje_json(mensaje_raw):
-    """
-    Intenta parsear el campo 'Mensaje' de la respuesta de Hércules.
-
-    - Si ya es un dict, lo devuelve tal cual.
-    - Si es un string JSON válido, hace json.loads.
-    - Si hay errores de escapes raros (\\ó, \\Ñ, \\×, etc.),
-      limpia esos escapes inválidos y vuelve a intentar.
-    - Si no se puede parsear, devuelve None.
-    """
-    if isinstance(mensaje_raw, dict):
-        return mensaje_raw
-
-    if not isinstance(mensaje_raw, str):
-        print(f"[DEBUG] parsear_mensaje_json: tipo inesperado: {type(mensaje_raw)}")
-        return None
-
-    # 1) Intento directo
-    try:
-        return json.loads(mensaje_raw)
-    except Exception as e:
-        print(f"[DEBUG] parsear_mensaje_json: error al hacer json.loads directo: {e}")
-
-    # 2) Limpiar escapes inválidos: \X donde X no es " / \ b f n r t u
-    patron = r'\\([^"\\/bfnrtu])'
-    mensaje_limpio = re.sub(patron, r'\1', mensaje_raw)
-
-    try:
-        return json.loads(mensaje_limpio)
-    except Exception as e:
-        print(f"[DEBUG] parsear_mensaje_json: error tras limpiar escapes: {e}")
-        print(f"[DEBUG] parsear_mensaje_json: contenido mensaje_limpio: {mensaje_limpio[:200]}...")
-        return None
-
-# =====================================================================
-# 8.2 FUNCIÓN QUE DECIDE SI SE COBRA O NO
-# =====================================================================
 
 def es_respuesta_exitosa_hercules(data: dict) -> bool:
     """
@@ -588,9 +550,9 @@ def es_respuesta_exitosa_hercules(data: dict) -> bool:
     Criterio:
       - Tipo == 0 (aceptando 0 o "0")
       - Mensaje no vacío
-      - Si existe 'Error' == True o 'error' con texto => fallo (no se cobra)
-      - Si hay 'codigoResultado' y NO es 'EXITOSO' => fallo
-      - Si no se puede parsear pero hay contenido y Tipo == 0 => éxito
+      - Si existe 'Error' == True o 'error' con mensaje de no encontrado -> fallo
+      - Si existe 'codigoResultado' y es distinto de 'EXITOSO' -> fallo
+      - En cualquier otro caso con Tipo == 0 -> éxito.
     """
     try:
         if isinstance(data, str):
@@ -600,55 +562,60 @@ def es_respuesta_exitosa_hercules(data: dict) -> bool:
             print(f"[DEBUG] es_respuesta_exitosa_hercules: data no es dict: {type(data)}")
             return False
 
-        tipo = data.get("Tipo") or data.get("tipo")
+        # 1) Validar Tipo == 0
+        tipo = data.get("Tipo")
+        if tipo is None:
+            tipo = data.get("tipo")
+
         if str(tipo) != "0":
             print(f"[DEBUG] es_respuesta_exitosa_hercules: Tipo != 0 -> {tipo}")
             return False
 
+        # 2) Extraer Mensaje
         mensaje_raw = data.get("Mensaje") or data.get("mensaje")
         if not mensaje_raw:
             print("[DEBUG] es_respuesta_exitosa_hercules: Mensaje vacío")
             return False
 
-        mensaje_json = parsear_mensaje_json(mensaje_raw)
-        if mensaje_json is None:
-            # No se pudo parsear, pero hay contenido y Tipo == 0:
-            # lo consideramos éxito (no castigamos al usuario por formato raro).
-            print("[DEBUG] es_respuesta_exitosa_hercules: no se pudo parsear Mensaje, lo consideramos éxito.")
+        if isinstance(mensaje_raw, str):
+            try:
+                mensaje_json = json.loads(mensaje_raw)
+            except Exception:
+                # No se pudo parsear, pero hay contenido y Tipo == 0 -> éxito
+                print("[DEBUG] es_respuesta_exitosa_hercules: no se pudo parsear Mensaje, pero hay contenido.")
+                return True
+        elif isinstance(mensaje_raw, dict):
+            mensaje_json = mensaje_raw
+        else:
+            print(f"[DEBUG] es_respuesta_exitosa_hercules: Mensaje tipo {type(mensaje_raw)}, lo aceptamos.")
             return True
 
+        # 3) Revisar banderas de error
         if isinstance(mensaje_json, dict):
-            # Error bool explícito
+            # Error explícito en mayúscula
             if mensaje_json.get("Error") is True:
                 print("[DEBUG] es_respuesta_exitosa_hercules: Error == True en mensaje_json")
                 return False
 
-            # error como texto
-            err_txt = mensaje_json.get("error")
-            if isinstance(err_txt, str) and err_txt.strip():
-                print(f"[DEBUG] es_respuesta_exitosa_hercules: error texto en mensaje_json -> {err_txt!r}")
-                return False
-
-            # código de resultado no exitoso
-            codigo = (
-                mensaje_json.get("codigoResultado")
-                or mensaje_json.get("codigo")
-            )
+            # codigoResultado distinto de EXITOSO
+            codigo = mensaje_json.get("codigoResultado") or mensaje_json.get("codigo")
             if codigo and str(codigo).upper() != "EXITOSO":
                 print(f"[DEBUG] es_respuesta_exitosa_hercules: codigoResultado != EXITOSO -> {codigo}")
                 return False
 
+            # error en minúscula con texto tipo "Vehiculo no encontrado"
+            err_text = mensaje_json.get("error")
+            if isinstance(err_text, str) and "no encontrado" in err_text.lower():
+                print(f"[DEBUG] es_respuesta_exitosa_hercules: error de 'no encontrado' -> {err_text}")
+                return False
+
+        # 4) Si llegamos aquí, consideramos éxito
         return True
 
     except Exception as e:
-        # Si algo raro pasa al analizar, por seguridad devolvemos False
-        # (no cobramos créditos), pero logueamos el error.
         print(f"[ERROR] Analizando respuesta de Hércules: {e}")
         return False
 
-# =====================================================================
-# 8.3 HILO QUE HACE POLLING
-# =====================================================================
 
 def ejecutar_consulta_en_hilo(
     chat_id: int,
@@ -731,8 +698,8 @@ def ejecutar_consulta_en_hilo(
 
 def formatear_respuesta_firma(data: dict) -> str:
     try:
-        mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
-        info = parsear_mensaje_json(mensaje_raw) or {}
+        mensaje_str = data.get("Mensaje") or data.get("mensaje") or ""
+        info = json.loads(mensaje_str)
 
         person = info.get("person", {}) or info.get("persona", {}) or {}
         nombre = " ".join(
@@ -759,15 +726,10 @@ def formatear_respuesta_firma(data: dict) -> str:
 
 def formatear_respuesta_persona(data: dict) -> str:
     try:
-        mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
-        info = parsear_mensaje_json(mensaje_raw) or {}
+        mensaje_str = data.get("Mensaje") or data.get("mensaje") or ""
+        info = json.loads(mensaje_str)
 
-        person = (
-            info.get("person")
-            or info.get("persona")
-            or info.get("personDTO")
-            or {}
-        )
+        person = info.get("person") or info.get("persona") or info.get("personDTO") or {}
         nombre = " ".join(
             [
                 person.get("nombre1", ""),
@@ -791,8 +753,8 @@ def formatear_respuesta_persona(data: dict) -> str:
 
 def formatear_respuesta_vehiculo(data: dict) -> str:
     try:
-        mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
-        info = parsear_mensaje_json(mensaje_raw) or {}
+        mensaje_str = data.get("Mensaje") or data.get("mensaje") or ""
+        info = json.loads(mensaje_str)
 
         veh = info.get("vehiculo", {}) or {}
         datos = veh.get("datos", {}) or {}
@@ -822,8 +784,8 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
 
 def formatear_respuesta_propietario(data: dict) -> str:
     try:
-        mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
-        info = parsear_mensaje_json(mensaje_raw) or {}
+        mensaje_str = data.get("Mensaje") or data.get("mensaje") or ""
+        info = json.loads(mensaje_str)
 
         persona = info.get("persona") or {}
         datos_empresa = persona.get("datosEmpresa") or info.get("datosEmpresa") or {}
@@ -950,12 +912,20 @@ def iniciar_consulta_persona(usuario: Usuario, chat_id: int, tipo_doc: str, num_
 
 
 def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
+    """
+    Consulta de vehículo por placa (tipo 3).
+    En IniciarConsulta la API espera:
+      "mensaje": "PDK400"
+    (solo la placa, no JSON).
+    """
     config = get_consulta_config(TIPO_CONSULTA_VEHICULO_SOLO)
     if not _verificar_creditos_o_mensaje(chat_id, usuario, config):
         return
 
     placa_limpia = placa.replace(" ", "").upper()
-    mensaje_payload = {"placa": placa_limpia, "solo_vehiculo": True}
+
+    # Para tipo 3, enviamos solo la placa como string
+    mensaje_payload = placa_limpia
 
     try:
         id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_VEHICULO_SOLO, mensaje_payload)
@@ -968,7 +938,7 @@ def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
         usuario=usuario,
         tipo_consulta=TIPO_CONSULTA_VEHICULO_SOLO,
         nombre_servicio="vehiculo_placa",
-        parametros=mensaje_payload,
+        parametros={"placa": placa_limpia},
         valor_consulta=config.valor_consulta,
     )
 
@@ -984,12 +954,18 @@ def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
 
 
 def iniciar_consulta_propietario(usuario: Usuario, chat_id: int, placa: str):
+    """
+    Consulta de propietario por placa (tipo 4).
+    Es muy probable que la API también espere solo la placa como string.
+    """
     config = get_consulta_config(TIPO_CONSULTA_PROPIETARIO_POR_PLACA)
     if not _verificar_creditos_o_mensaje(chat_id, usuario, config):
         return
 
     placa_limpia = placa.replace(" ", "").upper()
-    mensaje_payload = {"placa": placa_limpia}
+
+    # Enviamos solo la placa como string
+    mensaje_payload = placa_limpia
 
     try:
         id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_PROPIETARIO_POR_PLACA, mensaje_payload)
@@ -1002,7 +978,7 @@ def iniciar_consulta_propietario(usuario: Usuario, chat_id: int, placa: str):
         usuario=usuario,
         tipo_consulta=TIPO_CONSULTA_PROPIETARIO_POR_PLACA,
         nombre_servicio="propietario_placa",
-        parametros=mensaje_payload,
+        parametros={"placa": placa_limpia},
         valor_consulta=config.valor_consulta,
     )
 
@@ -1143,7 +1119,6 @@ def telegram_webhook():
             )
             return jsonify({"ok": True}), 200
 
-        # Si llega aquí sin estado, le pedimos que vuelva al menú
         enviar_mensaje(
             chat_id,
             "Primero elige el tipo de consulta (firma o persona) en el menú principal.",
@@ -1179,7 +1154,6 @@ def telegram_webhook():
         return jsonify({"ok": True}), 200
 
     # ----------------- MODO RÁPIDO (firma: CC 123456) -------------------
-    # Solo se usa cuando NO estamos en ningún flujo especial.
     if estado is None and text.upper().startswith(("CC ", "TI ", "CE ", "NIT ")):
         partes = text.split()
         if len(partes) >= 2:
