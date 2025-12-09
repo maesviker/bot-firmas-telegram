@@ -696,9 +696,24 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
     """
     Genera el informe vehicular en PDF (plantilla B7 v2) en memoria
     y devuelve los bytes del archivo.
+
+    Soporta que 'Mensaje' venga como string JSON o como dict ya deserializado.
     """
     mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
-    info = json.loads(mensaje_raw)
+
+    # --- NUEVO: soportar string o dict en Mensaje ---
+    info = {}
+    if isinstance(mensaje_raw, str):
+        try:
+            info = json.loads(mensaje_raw)
+        except Exception as e:
+            print(f"[ERROR] generar_informe_vehicular_B7_v2: no se pudo json.loads(Mensaje): {e}")
+            info = {}
+    elif isinstance(mensaje_raw, dict):
+        info = mensaje_raw
+    else:
+        print(f"[WARN] generar_informe_vehicular_B7_v2: Mensaje es tipo inesperado: {type(mensaje_raw)}")
+        info = {}
 
     # Soportar dos estructuras:
     # 1) {"vehiculo": {"datos":..., "adicional":...}, "persona": {...}}
@@ -1416,13 +1431,15 @@ def formatear_respuesta_persona(data: dict) -> str:
 
 def formatear_respuesta_vehiculo(data: dict) -> str:
     """
-    Formatea la respuesta de vehículo para mostrarla en Telegram
-    con un resumen profesional, pero usando *solo un campo por línea*.
+    Formatea la respuesta de vehículo para mostrarla en Telegram.
+    IMPORTANTE: no mezclar varios campos en la misma línea.
+    Cada campo va en su propia línea.
     """
     try:
         mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
         print(f"[DEBUG] formatear_respuesta_vehiculo.mensaje_raw (tipo={type(mensaje_raw)}): {mensaje_raw}")
 
+        # --- Parsear mensaje: puede ser string JSON o dict ---
         info = {}
         if isinstance(mensaje_raw, str):
             try:
@@ -1483,6 +1500,7 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
         print(f"[DEBUG] formatear_respuesta_vehiculo.datos: {datos}")
         print(f"[DEBUG] formatear_respuesta_vehiculo.adicional: {adicional}")
 
+        # Campos del vehículo
         placa = (
             datos.get("placaNumeroUnicoIdentificacion")
             or datos.get("placa")
@@ -1536,11 +1554,11 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
             for r in lista_rtm
         ) else "NO"
 
-        # Últimas póliza y RTM (si existen)
+        # Última póliza y RTM (si existen)
         ultima_poliza = soat_list[0] if soat_list else None
         ultima_rtm = lista_rtm[0] if lista_rtm else None
 
-        # Propietario (si viene en el mismo JSON con persona)
+        # Propietario (si viene en el JSON con persona)
         nombre_prop = "-"
         tipo_doc_prop = "-"
         nro_doc_prop = "-"
@@ -1576,78 +1594,77 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
                     }
                 )
 
-        # Blindado (si viene)
-        blindado = "-"
-        if isinstance(adicional, dict):
-            info_veh_dto = adicional.get("informacionVehiculoDTO") or {}
-            if isinstance(info_veh_dto, dict):
-                blindado = info_veh_dto.get("blindado", "-")
+        # Blindaje
+        info_veh_dto = adicional.get("informacionVehiculoDTO", {}) or {}
+        blindado = info_veh_dto.get("blindado", "-")
 
-        # Mensaje final: un campo por línea
+        # --- Construir mensaje, 1 campo por línea ---
         partes = []
 
         partes.append(f"🚗 *Informe vehicular – {placa}*")
         partes.append("")
-        partes.append("*1. Datos principales*")
-        partes.append(f"Placa: `{placa}`")
-        partes.append(f"Clase: {clase}")
-        partes.append(f"Servicio: {servicio}")
-        partes.append(f"Estado del registro: {estado_registro}")
 
+        # 1. Datos principales
+        partes.append("*1. Datos principales del vehículo*")
+        partes.append(f"• Placa: `{placa}`")
+        partes.append(f"• Clase: {clase}")
+        partes.append(f"• Servicio: {servicio}")
+        partes.append(f"• Estado del registro: {estado_registro}")
         partes.append("")
+
+        # 2. Características del vehículo (una sola etiqueta por línea)
         partes.append("*2. Características del vehículo*")
-        partes.append(f"Marca: {marca}")
-        partes.append(f"Línea: {linea}")
-        partes.append(f"Modelo: {modelo}")
-        partes.append(f"Color: {color}")
-        partes.append(f"Carrocería: {carroceria}")
-        partes.append(f"Cilindraje: {cilindraje} cc")
-        partes.append(f"Tipo de combustible: {tipo_combustible}")
-        partes.append(f"Nro. Motor: {numero_motor}")
-        partes.append(f"Nro. Chasis: {numero_chasis}")
-        partes.append(f"Nro. VIN: {vin}")
-
+        partes.append(f"• Marca: {marca}")
+        partes.append(f"• Línea: {linea}")
+        partes.append(f"• Modelo: {modelo}")
+        partes.append(f"• Color: {color}")
+        partes.append(f"• Carrocería: {carroceria}")
+        partes.append(f"• Cilindraje: {cilindraje}")
+        partes.append(f"• Tipo de combustible: {tipo_combustible}")
+        partes.append(f"• Nro. Motor: {numero_motor}")
+        partes.append(f"• Nro. Chasis: {numero_chasis}")
+        partes.append(f"• Nro. VIN: {vin}")
         partes.append("")
+
+        # 3. Documentos y seguridad
         partes.append("*3. Estado de documentos y seguridad*")
-        partes.append(f"Inscrito en RUNT: {inscrito_runt}")
-        partes.append(f"Posee gravámenes: {gravamenes}")
-        partes.append(f"SOAT vigente: {soat_vigente}")
+        partes.append(f"• Inscrito en RUNT: {inscrito_runt}")
+        partes.append(f"• Posee gravámenes: {gravamenes}")
+        partes.append(f"• SOAT vigente: {soat_vigente}")
         if ultima_poliza:
-            partes.append(f"Última póliza SOAT: {ultima_poliza.get('numeroPoliza','-')}")
-            partes.append(f"Aseguradora SOAT: {ultima_poliza.get('aseguradora','-')}")
-            partes.append(
-                f"Vigencia SOAT: {ultima_poliza.get('fechaInicio','-')} a {ultima_poliza.get('fechaVencimiento','-')}"
-            )
-        partes.append(f"RTM vigente: {rtm_vigente}")
+            partes.append("• Detalle de la última póliza SOAT:")
+            partes.append(f"  ─ Número de póliza: {ultima_poliza.get('numeroPoliza','-')}")
+            partes.append(f"  ─ Entidad aseguradora: {ultima_poliza.get('aseguradora','-')}")
+            partes.append(f"  ─ Fecha inicio vigencia: {ultima_poliza.get('fechaInicio','-')}")
+            partes.append(f"  ─ Fecha fin vigencia: {ultima_poliza.get('fechaVencimiento','-')}")
+        partes.append(f"• RTM vigente: {rtm_vigente}")
         if ultima_rtm:
-            partes.append(f"Última revisión RTM: {ultima_rtm.get('tipoRevision','-')}")
-            partes.append(f"CDA RTM: {ultima_rtm.get('nombreCda','-')}")
-            partes.append(
-                f"Vigencia RTM: {ultima_rtm.get('fechaExpedicion','-')} a {ultima_rtm.get('fechaVigencia','-')}"
-            )
-
-        if nombre_prop != "-" or nro_doc_prop != "-":
-            partes.append("")
-            partes.append("*4. Propietario*")
-            partes.append(f"Nombre: {nombre_prop}")
-            partes.append(f"Documento: {tipo_doc_prop} {nro_doc_prop}")
-
+            partes.append("• Detalle de la última revisión técnico-mecánica:")
+            partes.append(f"  ─ Tipo de revisión: {ultima_rtm.get('tipoRevision','-')}")
+            partes.append(f"  ─ CDA: {ultima_rtm.get('nombreCda','-')}")
+            partes.append(f"  ─ Fecha expedición: {ultima_rtm.get('fechaExpedicion','-')}")
+            partes.append(f"  ─ Fecha vigencia: {ultima_rtm.get('fechaVigencia','-')}")
         partes.append("")
-        partes.append("*5. Resumen adicional*")
-        partes.append(f"Blindado: {blindado}")
-        partes.append(f"Accidentes reportados: {accidentes_count}")
+
+        # 4. Propietario (si hay información)
+        if nombre_prop != "-" or nro_doc_prop != "-":
+            partes.append("*4. Propietario*")
+            partes.append(f"• Nombre / Razón social: {nombre_prop}")
+            partes.append(f"• Tipo de documento: {tipo_doc_prop}")
+            partes.append(f"• Número de documento: {nro_doc_prop}")
+            partes.append("")
+
+        # 5. Información adicional
+        partes.append("*5. Información adicional*")
+        partes.append(f"• Blindado: {blindado}")
+        partes.append(f"• Accidentes reportados: {accidentes_count}")
         if licencias_list:
-            partes.append("Licencia(s) de conducción asociada(s):")
-            for lic in licencias_list:
-                partes.append(
-                    f"Nro. licencia: {lic['numero']}"
-                )
-                partes.append(
-                    f"Categoría licencia: {lic['categoria']}"
-                )
-                partes.append(
-                    f"Estado licencia: {lic['estado']}"
-                )
+            partes.append("• Licencia(s) de conducción asociada(s):")
+            for idx, lic in enumerate(licencias_list, start=1):
+                partes.append(f"  ─ Licencia #{idx}:")
+                partes.append(f"    • Número de licencia: {lic['numero']}")
+                partes.append(f"    • Categoría: {lic['categoria']}")
+                partes.append(f"    • Estado: {lic['estado']}")
 
         return "\n".join(partes)
 
@@ -1959,7 +1976,12 @@ def ejecutar_consulta_en_hilo(
                         placa_para_nombre = "VEHICULO"
                         try:
                             mensaje_str_local = ultimo_data.get("Mensaje") or ultimo_data.get("mensaje") or ""
-                            info_local = json.loads(mensaje_str_local)
+                            info_local = {}
+                            if isinstance(mensaje_str_local, str):
+                                info_local = json.loads(mensaje_str_local)
+                            elif isinstance(mensaje_str_local, dict):
+                                info_local = mensaje_str_local
+
                             # Soportar estructuras con 'vehiculo' o con 'datos' en la raíz
                             veh_local = info_local.get("vehiculo") or {}
                             if not veh_local and "datos" in info_local:
