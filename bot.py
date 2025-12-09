@@ -1417,7 +1417,7 @@ def formatear_respuesta_persona(data: dict) -> str:
 def formatear_respuesta_vehiculo(data: dict) -> str:
     """
     Formatea la respuesta de vehículo para mostrarla en Telegram
-    con un resumen profesional y compacto.
+    con un resumen profesional, pero usando *solo un campo por línea*.
     """
     try:
         mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
@@ -1576,60 +1576,77 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
                     }
                 )
 
-        # Mensaje final
+        # Blindado (si viene)
+        blindado = "-"
+        if isinstance(adicional, dict):
+            info_veh_dto = adicional.get("informacionVehiculoDTO") or {}
+            if isinstance(info_veh_dto, dict):
+                blindado = info_veh_dto.get("blindado", "-")
+
+        # Mensaje final: un campo por línea
         partes = []
 
         partes.append(f"🚗 *Informe vehicular – {placa}*")
         partes.append("")
         partes.append("*1. Datos principales*")
-        partes.append(f"• Placa: `{placa}`")
-        partes.append(f"• Clase: {clase}")
-        partes.append(f"• Servicio: {servicio}")
-        partes.append(f"• Estado del registro: {estado_registro}")
+        partes.append(f"Placa: `{placa}`")
+        partes.append(f"Clase: {clase}")
+        partes.append(f"Servicio: {servicio}")
+        partes.append(f"Estado del registro: {estado_registro}")
+
         partes.append("")
         partes.append("*2. Características del vehículo*")
-        partes.append(f"• Marca / Línea / Modelo: {marca} {linea} {modelo}")
-        partes.append(f"• Color / Carrocería: {color} / {carroceria}")
-        partes.append(f"• Cilindraje: {cilindraje} cc")
-        partes.append(f"• Tipo de combustible: {tipo_combustible}")
-        partes.append(f"• Motor: {numero_motor}")
-        partes.append(f"• Chasis / VIN: {numero_chasis} / {vin}")
+        partes.append(f"Marca: {marca}")
+        partes.append(f"Línea: {linea}")
+        partes.append(f"Modelo: {modelo}")
+        partes.append(f"Color: {color}")
+        partes.append(f"Carrocería: {carroceria}")
+        partes.append(f"Cilindraje: {cilindraje} cc")
+        partes.append(f"Tipo de combustible: {tipo_combustible}")
+        partes.append(f"Nro. Motor: {numero_motor}")
+        partes.append(f"Nro. Chasis: {numero_chasis}")
+        partes.append(f"Nro. VIN: {vin}")
+
         partes.append("")
         partes.append("*3. Estado de documentos y seguridad*")
-        partes.append(f"• Inscrito en RUNT: {inscrito_runt}")
-        partes.append(f"• Posee gravámenes: {gravamenes}")
-        partes.append(f"• SOAT vigente: {soat_vigente}")
+        partes.append(f"Inscrito en RUNT: {inscrito_runt}")
+        partes.append(f"Posee gravámenes: {gravamenes}")
+        partes.append(f"SOAT vigente: {soat_vigente}")
         if ultima_poliza:
+            partes.append(f"Última póliza SOAT: {ultima_poliza.get('numeroPoliza','-')}")
+            partes.append(f"Aseguradora SOAT: {ultima_poliza.get('aseguradora','-')}")
             partes.append(
-                f"  └ Última póliza: {ultima_poliza.get('numeroPoliza','-')} – {ultima_poliza.get('aseguradora','-')}"
+                f"Vigencia SOAT: {ultima_poliza.get('fechaInicio','-')} a {ultima_poliza.get('fechaVencimiento','-')}"
             )
-            partes.append(
-                f"    Vigencia: {ultima_poliza.get('fechaInicio','-')} a {ultima_poliza.get('fechaVencimiento','-')}"
-            )
-        partes.append(f"• RTM vigente: {rtm_vigente}")
+        partes.append(f"RTM vigente: {rtm_vigente}")
         if ultima_rtm:
+            partes.append(f"Última revisión RTM: {ultima_rtm.get('tipoRevision','-')}")
+            partes.append(f"CDA RTM: {ultima_rtm.get('nombreCda','-')}")
             partes.append(
-                f"  └ Última revisión: {ultima_rtm.get('tipoRevision','-')} – {ultima_rtm.get('nombreCda','-')}"
-            )
-            partes.append(
-                f"    Vigencia: {ultima_rtm.get('fechaExpedicion','-')} a {ultima_rtm.get('fechaVigencia','-')}"
+                f"Vigencia RTM: {ultima_rtm.get('fechaExpedicion','-')} a {ultima_rtm.get('fechaVigencia','-')}"
             )
 
         if nombre_prop != "-" or nro_doc_prop != "-":
             partes.append("")
             partes.append("*4. Propietario*")
-            partes.append(f"• Nombre: {nombre_prop}")
-            partes.append(f"• Documento: {tipo_doc_prop} {nro_doc_prop}")
+            partes.append(f"Nombre: {nombre_prop}")
+            partes.append(f"Documento: {tipo_doc_prop} {nro_doc_prop}")
 
         partes.append("")
         partes.append("*5. Resumen adicional*")
-        partes.append(f"• Blindado: {info.get('adicional', {}).get('informacionVehiculoDTO', {}).get('blindado', '-') if isinstance(info.get('adicional'), dict) else '-'}")
-        partes.append(f"• Accidentes reportados: {accidentes_count}")
+        partes.append(f"Blindado: {blindado}")
+        partes.append(f"Accidentes reportados: {accidentes_count}")
         if licencias_list:
-            partes.append("• Licencia(s) de conducción asociada(s):")
+            partes.append("Licencia(s) de conducción asociada(s):")
             for lic in licencias_list:
                 partes.append(
-                    f"  └ No. {lic['numero']} – Categoría {lic['categoria']} – Estado: {lic['estado']}"
+                    f"Nro. licencia: {lic['numero']}"
+                )
+                partes.append(
+                    f"Categoría licencia: {lic['categoria']}"
+                )
+                partes.append(
+                    f"Estado licencia: {lic['estado']}"
                 )
 
         return "\n".join(partes)
