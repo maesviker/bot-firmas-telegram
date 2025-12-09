@@ -541,34 +541,70 @@ def llamar_resultados(id_peticion: str) -> dict:
 
 def es_respuesta_exitosa_hercules(data: dict) -> bool:
     """
-    Determina si una respuesta de /resultados se considera "exitosa"
-    para efectos de cobro de créditos.
+    Determina si la respuesta de Hércules es considerada "exitosa"
+    para efectos de COBRO de créditos.
+
+    Criterio:
+      - Tipo == 0 (aceptando 0 o "0")
+      - Mensaje no vacío
+      - Si existe 'Error' en el JSON interno y es True -> se considera fallo.
+      - En cualquier otro caso con Tipo == 0 -> éxito.
     """
     try:
+        # A veces puede venir como string JSON completo
+        if isinstance(data, str):
+            data = json.loads(data)
+
+        if not isinstance(data, dict):
+            print(f"[DEBUG] es_respuesta_exitosa_hercules: data no es dict: {type(data)}")
+            return False
+
+        # 1) Validar Tipo == 0 (aceptamos string "0" también)
         tipo = data.get("Tipo")
         if tipo is None:
             tipo = data.get("tipo")
 
-        if tipo != 0:
+        if str(tipo) != "0":
+            print(f"[DEBUG] es_respuesta_exitosa_hercules: Tipo != 0 -> {tipo}")
             return False
 
-        mensaje_str = data.get("Mensaje") or data.get("mensaje") or ""
-        if not mensaje_str:
+        # 2) Extraer Mensaje (puede ser string JSON o dict)
+        mensaje_raw = data.get("Mensaje") or data.get("mensaje")
+        if not mensaje_raw:
+            print("[DEBUG] es_respuesta_exitosa_hercules: Mensaje vacío")
             return False
 
-        mensaje_json = json.loads(mensaje_str)
+        # Si viene como string JSON, lo parseamos
+        if isinstance(mensaje_raw, str):
+            try:
+                mensaje_json = json.loads(mensaje_raw)
+            except Exception:
+                # Si no se puede parsear, igual lo consideramos éxito
+                # porque Tipo == 0 y hay contenido.
+                print("[DEBUG] es_respuesta_exitosa_hercules: no se pudo parsear Mensaje, pero hay contenido.")
+                return True
+        elif isinstance(mensaje_raw, dict):
+            mensaje_json = mensaje_raw
+        else:
+            # Otro tipo raro, pero con Tipo == 0 y mensaje no vacío -> éxito
+            print(f"[DEBUG] es_respuesta_exitosa_hercules: Mensaje tipo {type(mensaje_raw)}, lo aceptamos.")
+            return True
 
+        # 3) Si el JSON interno tiene Error == True en la raíz, lo tratamos como fallo
         if isinstance(mensaje_json, dict):
             if mensaje_json.get("Error") is True:
-                return False
-            codigo = mensaje_json.get("codigoResultado") or mensaje_json.get("codigo")
-            if codigo and str(codigo).upper() != "EXITOSO":
+                print("[DEBUG] es_respuesta_exitosa_hercules: Error == True en mensaje_json")
                 return False
 
+        # 4) Si llegamos aquí, consideramos la respuesta como exitosa
         return True
+
     except Exception as e:
-        print(f"[ERROR] Analizando respuesta Hércules: {e}")
+        # Si algo raro pasa al analizar, por seguridad devolvemos False
+        # (no cobramos créditos), pero logueamos el error.
+        print(f"[ERROR] Analizando respuesta de Hércules: {e}")
         return False
+
 
 
 def ejecutar_consulta_en_hilo(
