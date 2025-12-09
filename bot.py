@@ -4,6 +4,7 @@ import time
 import threading
 from datetime import datetime
 from typing import Optional, Dict, Any
+import re  # 👈 añadido para limpiar escapes inválidos
 
 import requests
 from flask import Flask, request, jsonify
@@ -388,7 +389,7 @@ except ImportError:
             "❌ Ocurrió un error realizando la consulta.\n"
             "Por favor inténtalo de nuevo más tarde."
         )
-        MENSAJE_SIN_DATOS = "ℹ️ No se encontraron datos para los parámetros enviados."
+        MENSAJE_SIN_DATOS = "ℹ️ La consulta fue procesada pero no se encontraron datos para los parámetros enviados."
         MENSAJE_SALDO = (
             "💰 *Tu saldo de créditos*\n\n"
             "Totales: {total}\n"
@@ -482,9 +483,9 @@ def llamar_iniciar_consulta(tipo_consulta: int, mensaje_payload: Dict[str, Any])
     mensaje_str = json.dumps(mensaje_payload, ensure_ascii=False)
 
     body = {
-        "token": HERCULES_TOKEN,          # o HERCULES_TOKEN si así lo llamaste
-        "tipo": tipo_consulta,      # 3, 4, 5, 8, etc.
-        "mensaje": mensaje_str,     # JSON serializado como string
+        "token": HERCULES_TOKEN,
+        "tipo": tipo_consulta,
+        "mensaje": mensaje_str,
     }
 
     print(f"[DEBUG] IniciarConsulta payload: {body}")
@@ -520,7 +521,6 @@ def llamar_iniciar_consulta(tipo_consulta: int, mensaje_payload: Dict[str, Any])
     raise RuntimeError(f"Respuesta no esperada de IniciarConsulta: {data}")
 
 
-
 def llamar_resultados(id_peticion: str) -> dict:
     """
     Llama a GET /api/resultados/{token}/{idPeticion}
@@ -538,6 +538,47 @@ def llamar_resultados(id_peticion: str) -> dict:
     print(f"[DEBUG] Respuesta Resultados: {data}")
     return data
 
+# =====================================================================
+# 8.1 PARSER TOLERANTE PARA MENSAJE (JSON CON ESCAPES RAROS)
+# =====================================================================
+
+def parsear_mensaje_json(mensaje_raw):
+    """
+    Intenta parsear el campo 'Mensaje' de la respuesta de Hércules.
+
+    - Si ya es un dict, lo devuelve tal cual.
+    - Si es un string JSON válido, hace json.loads.
+    - Si hay errores de escapes raros (\\ó, \\Ñ, \\×, etc.),
+      limpia esos escapes inválidos y vuelve a intentar.
+    - Si no se puede parsear, devuelve None.
+    """
+    if isinstance(mensaje_raw, dict):
+        return mensaje_raw
+
+    if not isinstance(mensaje_raw, str):
+        print(f"[DEBUG] parsear_mensaje_json: tipo inesperado: {type(mensaje_raw)}")
+        return None
+
+    # 1) Intento directo
+    try:
+        return json.loads(mensaje_raw)
+    except Exception as e:
+        print(f"[DEBUG] parsear_mensaje_json: error al hacer json.loads directo: {e}")
+
+    # 2) Limpiar escapes inválidos: \X donde X no es " / \ b f n r t u
+    patron = r'\\([^"\\/bfnrtu])'
+    mensaje_limpio = re.sub(patron, r'\1', mensaje_raw)
+
+    try:
+        return json.loads(mensaje_limpio)
+    except Exception as e:
+        print(f"[DEBUG] parsear_mensaje_json: error tras limpiar escapes: {e}")
+        print(f"[DEBUG] parsear_mensaje_json: contenido mensaje_limpio: {mensaje_limpio[:200]}...")
+        return None
+
+# =====================================================================
+# 8.2 FUNCIÓN QUE DECIDE SI SE COBRA O NO
+# =====================================================================
 
 def es_respuesta_exitosa_hercules(data: dict) -> bool:
     """
@@ -547,11 +588,11 @@ def es_respuesta_exitosa_hercules(data: dict) -> bool:
     Criterio:
       - Tipo == 0 (aceptando 0 o "0")
       - Mensaje no vacío
-      - Si existe 'Error' en el JSON interno y es True -> se considera fallo.
-      - En cualquier otro caso con Tipo == 0 -> éxito.
+      - Si existe 'Error' == True o 'error' con texto => fallo (no se cobra)
+      - Si hay 'codigoResultado' y NO es 'EXITOSO' => fallo
+      - Si no se puede parsear pero hay contenido y Tipo == 0 => éxito
     """
     try:
-        # A veces puede venir como string JSON completo
         if isinstance(data, str):
             data = json.loads(data)
 
@@ -559,44 +600,44 @@ def es_respuesta_exitosa_hercules(data: dict) -> bool:
             print(f"[DEBUG] es_respuesta_exitosa_hercules: data no es dict: {type(data)}")
             return False
 
-        # 1) Validar Tipo == 0 (aceptamos string "0" también)
-        tipo = data.get("Tipo")
-        if tipo is None:
-            tipo = data.get("tipo")
-
+        tipo = data.get("Tipo") or data.get("tipo")
         if str(tipo) != "0":
             print(f"[DEBUG] es_respuesta_exitosa_hercules: Tipo != 0 -> {tipo}")
             return False
 
-        # 2) Extraer Mensaje (puede ser string JSON o dict)
         mensaje_raw = data.get("Mensaje") or data.get("mensaje")
         if not mensaje_raw:
             print("[DEBUG] es_respuesta_exitosa_hercules: Mensaje vacío")
             return False
 
-        # Si viene como string JSON, lo parseamos
-        if isinstance(mensaje_raw, str):
-            try:
-                mensaje_json = json.loads(mensaje_raw)
-            except Exception:
-                # Si no se puede parsear, igual lo consideramos éxito
-                # porque Tipo == 0 y hay contenido.
-                print("[DEBUG] es_respuesta_exitosa_hercules: no se pudo parsear Mensaje, pero hay contenido.")
-                return True
-        elif isinstance(mensaje_raw, dict):
-            mensaje_json = mensaje_raw
-        else:
-            # Otro tipo raro, pero con Tipo == 0 y mensaje no vacío -> éxito
-            print(f"[DEBUG] es_respuesta_exitosa_hercules: Mensaje tipo {type(mensaje_raw)}, lo aceptamos.")
+        mensaje_json = parsear_mensaje_json(mensaje_raw)
+        if mensaje_json is None:
+            # No se pudo parsear, pero hay contenido y Tipo == 0:
+            # lo consideramos éxito (no castigamos al usuario por formato raro).
+            print("[DEBUG] es_respuesta_exitosa_hercules: no se pudo parsear Mensaje, lo consideramos éxito.")
             return True
 
-        # 3) Si el JSON interno tiene Error == True en la raíz, lo tratamos como fallo
         if isinstance(mensaje_json, dict):
+            # Error bool explícito
             if mensaje_json.get("Error") is True:
                 print("[DEBUG] es_respuesta_exitosa_hercules: Error == True en mensaje_json")
                 return False
 
-        # 4) Si llegamos aquí, consideramos la respuesta como exitosa
+            # error como texto
+            err_txt = mensaje_json.get("error")
+            if isinstance(err_txt, str) and err_txt.strip():
+                print(f"[DEBUG] es_respuesta_exitosa_hercules: error texto en mensaje_json -> {err_txt!r}")
+                return False
+
+            # código de resultado no exitoso
+            codigo = (
+                mensaje_json.get("codigoResultado")
+                or mensaje_json.get("codigo")
+            )
+            if codigo and str(codigo).upper() != "EXITOSO":
+                print(f"[DEBUG] es_respuesta_exitosa_hercules: codigoResultado != EXITOSO -> {codigo}")
+                return False
+
         return True
 
     except Exception as e:
@@ -605,7 +646,9 @@ def es_respuesta_exitosa_hercules(data: dict) -> bool:
         print(f"[ERROR] Analizando respuesta de Hércules: {e}")
         return False
 
-
+# =====================================================================
+# 8.3 HILO QUE HACE POLLING
+# =====================================================================
 
 def ejecutar_consulta_en_hilo(
     chat_id: int,
@@ -688,8 +731,8 @@ def ejecutar_consulta_en_hilo(
 
 def formatear_respuesta_firma(data: dict) -> str:
     try:
-        mensaje_str = data.get("Mensaje") or data.get("mensaje") or ""
-        info = json.loads(mensaje_str)
+        mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
+        info = parsear_mensaje_json(mensaje_raw) or {}
 
         person = info.get("person", {}) or info.get("persona", {}) or {}
         nombre = " ".join(
@@ -716,10 +759,15 @@ def formatear_respuesta_firma(data: dict) -> str:
 
 def formatear_respuesta_persona(data: dict) -> str:
     try:
-        mensaje_str = data.get("Mensaje") or data.get("mensaje") or ""
-        info = json.loads(mensaje_str)
+        mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
+        info = parsear_mensaje_json(mensaje_raw) or {}
 
-        person = info.get("person") or info.get("persona") or info.get("personDTO") or {}
+        person = (
+            info.get("person")
+            or info.get("persona")
+            or info.get("personDTO")
+            or {}
+        )
         nombre = " ".join(
             [
                 person.get("nombre1", ""),
@@ -743,8 +791,8 @@ def formatear_respuesta_persona(data: dict) -> str:
 
 def formatear_respuesta_vehiculo(data: dict) -> str:
     try:
-        mensaje_str = data.get("Mensaje") or data.get("mensaje") or ""
-        info = json.loads(mensaje_str)
+        mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
+        info = parsear_mensaje_json(mensaje_raw) or {}
 
         veh = info.get("vehiculo", {}) or {}
         datos = veh.get("datos", {}) or {}
@@ -774,8 +822,8 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
 
 def formatear_respuesta_propietario(data: dict) -> str:
     try:
-        mensaje_str = data.get("Mensaje") or data.get("mensaje") or ""
-        info = json.loads(mensaje_str)
+        mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
+        info = parsear_mensaje_json(mensaje_raw) or {}
 
         persona = info.get("persona") or {}
         datos_empresa = persona.get("datosEmpresa") or info.get("datosEmpresa") or {}
