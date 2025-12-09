@@ -479,6 +479,12 @@ def llamar_iniciar_consulta(tipo_consulta: int, mensaje_payload: Any) -> str:
     Además:
       - Si mensaje_payload es dict/list -> se serializa a JSON.
       - Si mensaje_payload es str -> se manda tal cual (sin json.dumps).
+
+    Nota:
+      Para algunas consultas (vehículo, propietario, firma, persona)
+      el llamador ya formatea mensaje_payload como string simple:
+        - Vehículo / propietario: "PDK400"
+        - Firma / persona: "CC,15645123"
     """
     url = f"{API_BASE}/api/IniciarConsulta"
 
@@ -597,7 +603,7 @@ def es_respuesta_exitosa_hercules(data: dict) -> bool:
                 print("[DEBUG] es_respuesta_exitosa_hercules: Error == True en mensaje_json")
                 return False
 
-            # codigoResultado distinto de EXITOSO
+            # codigoResultado distinto de EXITOSO (si viene en la raíz)
             codigo = mensaje_json.get("codigoResultado") or mensaje_json.get("codigo")
             if codigo and str(codigo).upper() != "EXITOSO":
                 print(f"[DEBUG] es_respuesta_exitosa_hercules: codigoResultado != EXITOSO -> {codigo}")
@@ -864,7 +870,6 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
         return textos.MENSAJE_ERROR_GENERICO
 
 
-
 def formatear_respuesta_propietario(data: dict) -> str:
     try:
         mensaje_str = data.get("Mensaje") or data.get("mensaje") or ""
@@ -929,14 +934,23 @@ def _verificar_creditos_o_mensaje(chat_id: int, usuario: Usuario, config: Consul
 
 
 def iniciar_consulta_firma(usuario: Usuario, chat_id: int, tipo_doc: str, num_doc: str):
+    """
+    Consulta de firma (tipo 8).
+
+    La API espera en IniciarConsulta:
+      "mensaje": "CC,15645123"
+    """
     config = get_consulta_config(TIPO_CONSULTA_FIRMA)
     if not _verificar_creditos_o_mensaje(chat_id, usuario, config):
         return
 
-    mensaje_payload = {"tipoDocumento": tipo_doc, "numeroDocumento": num_doc}
+    # Lo que guardamos en BD (para historial)
+    parametros_db = {"tipoDocumento": tipo_doc, "numeroDocumento": num_doc}
+    # Lo que enviamos a la API Hércules
+    mensaje_payload_api = f"{tipo_doc},{num_doc}"
 
     try:
-        id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_FIRMA, mensaje_payload)
+        id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_FIRMA, mensaje_payload_api)
     except Exception as e:
         print(f"[ERROR] iniciar_consulta_firma -> IniciarConsulta: {e}")
         enviar_mensaje(chat_id, textos.MENSAJE_ERROR_GENERICO)
@@ -946,7 +960,7 @@ def iniciar_consulta_firma(usuario: Usuario, chat_id: int, tipo_doc: str, num_do
         usuario=usuario,
         tipo_consulta=TIPO_CONSULTA_FIRMA,
         nombre_servicio="firma",
-        parametros=mensaje_payload,
+        parametros=parametros_db,
         valor_consulta=config.valor_consulta,
     )
 
@@ -955,21 +969,28 @@ def iniciar_consulta_firma(usuario: Usuario, chat_id: int, tipo_doc: str, num_do
         usuario=usuario,
         mensaje_id=msg_id,
         tipo_consulta=TIPO_CONSULTA_FIRMA,
-        mensaje_parametro_str=json.dumps(mensaje_payload, ensure_ascii=False),
+        mensaje_parametro_str=mensaje_payload_api,
         id_peticion=id_peticion,
         formateador_respuesta=formatear_respuesta_firma,
     )
 
 
 def iniciar_consulta_persona(usuario: Usuario, chat_id: int, tipo_doc: str, num_doc: str):
+    """
+    Consulta de persona (tipo 5).
+
+    La API también espera:
+      "mensaje": "CC,15645123"
+    """
     config = get_consulta_config(TIPO_CONSULTA_PERSONA)
     if not _verificar_creditos_o_mensaje(chat_id, usuario, config):
         return
 
-    mensaje_payload = {"tipoDocumento": tipo_doc, "numeroDocumento": num_doc}
+    parametros_db = {"tipoDocumento": tipo_doc, "numeroDocumento": num_doc}
+    mensaje_payload_api = f"{tipo_doc},{num_doc}"
 
     try:
-        id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_PERSONA, mensaje_payload)
+        id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_PERSONA, mensaje_payload_api)
     except Exception as e:
         print(f"[ERROR] iniciar_consulta_persona -> IniciarConsulta: {e}")
         enviar_mensaje(chat_id, textos.MENSAJE_ERROR_GENERICO)
@@ -979,7 +1000,7 @@ def iniciar_consulta_persona(usuario: Usuario, chat_id: int, tipo_doc: str, num_
         usuario=usuario,
         tipo_consulta=TIPO_CONSULTA_PERSONA,
         nombre_servicio="persona",
-        parametros=mensaje_payload,
+        parametros=parametros_db,
         valor_consulta=config.valor_consulta,
     )
 
@@ -988,7 +1009,7 @@ def iniciar_consulta_persona(usuario: Usuario, chat_id: int, tipo_doc: str, num_
         usuario=usuario,
         mensaje_id=msg_id,
         tipo_consulta=TIPO_CONSULTA_PERSONA,
-        mensaje_parametro_str=json.dumps(mensaje_payload, ensure_ascii=False),
+        mensaje_parametro_str=mensaje_payload_api,
         id_peticion=id_peticion,
         formateador_respuesta=formatear_respuesta_persona,
     )
