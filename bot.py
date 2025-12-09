@@ -59,7 +59,7 @@ API_BASE = os.getenv(
 # Intervalo entre consultas a /resultados (segundos)
 RESULTADOS_INTERVALO = int(os.getenv("RESULTADOS_INTERVALO", "4"))
 # Tiempo máximo de espera total para resultados (segundos)
-RESULTADOS_TIMEOUT = int(os.getenv("RESULTADOS_TIMEOUT", "60"))
+RESULTADOS_TIMEOUT = int(os.getenv("RESULTADOS_TIMEOUT", "180"))
 
 # ---------------------------------------------------------------
 # 1.3 CONFIGURACIÓN BASE DE DATOS
@@ -752,14 +752,95 @@ def formatear_respuesta_persona(data: dict) -> str:
 
 
 def formatear_respuesta_vehiculo(data: dict) -> str:
+    """
+    Formatea la respuesta de vehículo para mostrarla en Telegram.
+
+    Soporta estas estructuras de Mensaje:
+      1) {"vehiculo": {"datos": {...}, "adicional": {...}}}
+      2) {"datos": {...}, "adicional": {...}}
+      3) {"placaNumeroUnicoIdentificacion": "...", ...} (campos en la raíz)
+    """
     try:
-        mensaje_str = data.get("Mensaje") or data.get("mensaje") or ""
-        info = json.loads(mensaje_str)
+        mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
 
-        veh = info.get("vehiculo", {}) or {}
-        datos = veh.get("datos", {}) or {}
+        # Log de depuración para ver EXACTAMENTE qué viene de Hércules
+        print(f"[DEBUG] formatear_respuesta_vehiculo.mensaje_raw (tipo={type(mensaje_raw)}): {mensaje_raw}")
 
-        placa = datos.get("placaNumeroUnicoIdentificacion") or datos.get("placa") or "-"
+        # -------------------------------------------
+        # 1) Normalizar a dict: info
+        # -------------------------------------------
+        info = {}
+        if isinstance(mensaje_raw, str):
+            # Si es string, intentamos parsear como JSON
+            try:
+                info = json.loads(mensaje_raw)
+            except Exception as e:
+                # Si no se puede parsear, lo logueamos y devolvemos algo decente
+                print(f"[ERROR] formatear_respuesta_vehiculo: no se pudo json.loads(mensaje_raw): {e}")
+                # En este caso, como no hay estructura JSON, mostramos el texto tal cual
+                return (
+                    "🚗 *Respuesta de vehículo (sin formato JSON)*\n\n"
+                    f"`{mensaje_raw}`"
+                )
+        elif isinstance(mensaje_raw, dict):
+            info = mensaje_raw
+        else:
+            # Tipo raro, lo mostramos sin romper
+            print(f"[DEBUG] formatear_respuesta_vehiculo: mensaje_raw tipo inesperado: {type(mensaje_raw)}")
+            return (
+                "🚗 *Respuesta de vehículo (formato no esperado)*\n\n"
+                f"`{str(mensaje_raw)}`"
+            )
+
+        print(f"[DEBUG] formatear_respuesta_vehiculo.info (tipo={type(info)}): {info}")
+
+        # -------------------------------------------
+        # 2) Localizar el bloque "datos"
+        # -------------------------------------------
+        datos = {}
+
+        # Caso 2: {"datos": {...}, "adicional": {...}}
+        if isinstance(info, dict) and "datos" in info and isinstance(info["datos"], dict):
+            datos = info["datos"]
+            print("[DEBUG] formatear_respuesta_vehiculo: usando info['datos']")
+        else:
+            # Caso 1: {"vehiculo": {"datos": {...}}} o {"vehiculo": {...}}
+            veh = info.get("vehiculo")
+            if isinstance(veh, dict):
+                if "datos" in veh and isinstance(veh["datos"], dict):
+                    datos = veh["datos"]
+                    print("[DEBUG] formatear_respuesta_vehiculo: usando info['vehiculo']['datos']")
+                else:
+                    # A veces todos los campos están directamente en "vehiculo"
+                    datos = veh
+                    print("[DEBUG] formatear_respuesta_vehiculo: usando info['vehiculo'] directo")
+            else:
+                # Caso 3: los campos están directamente en la raíz del JSON
+                if any(
+                    k in info
+                    for k in (
+                        "placaNumeroUnicoIdentificacion",
+                        "placa",
+                        "marcaVehiculo",
+                        "lineaVehiculo",
+                    )
+                ):
+                    datos = info
+                    print("[DEBUG] formatear_respuesta_vehiculo: usando info directo (campos en raíz)")
+                else:
+                    print("[DEBUG] formatear_respuesta_vehiculo: no se encontró 'datos' ni 'vehiculo' adecuados")
+
+        datos = datos or {}
+        print(f"[DEBUG] formatear_respuesta_vehiculo.datos: {datos}")
+
+        # -------------------------------------------
+        # 3) Extraer campos individuales
+        # -------------------------------------------
+        placa = (
+            datos.get("placaNumeroUnicoIdentificacion")
+            or datos.get("placa")
+            or "-"
+        )
         marca = datos.get("marcaVehiculo") or "-"
         linea = datos.get("lineaVehiculo") or "-"
         modelo = datos.get("modelo") or "-"
@@ -777,9 +858,11 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
             f"*Clase:* {clase}\n"
             f"*Servicio:* {servicio}\n"
         )
+
     except Exception as e:
         print(f"[ERROR] formateando vehículo: {e}")
         return textos.MENSAJE_ERROR_GENERICO
+
 
 
 def formatear_respuesta_propietario(data: dict) -> str:
