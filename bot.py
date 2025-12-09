@@ -702,32 +702,114 @@ def ejecutar_consulta_en_hilo(
 # 9. FORMATEADORES DE RESPUESTA
 # =====================================================================
 
+
+
 def formatear_respuesta_firma(data: dict) -> str:
+    """
+    Formatea la respuesta de consulta de firma.
+
+    Soporta:
+      1) Formato "viejo": {"person": {...}} o {"persona": {...}}
+         con nombre1, nombre2, apellido1, apellido2, etc.
+      2) Formato "nuevo": {"nombres": "...", "apellidos": "...",
+                           "grupoSanguineo": "...", "sexo": "...",
+                           "fechaNacimiento": "...", "lugarNacimiento": "...",
+                           "Error": false, ...}
+         directamente en la raíz del JSON.
+    """
     try:
-        mensaje_str = data.get("Mensaje") or data.get("mensaje") or ""
-        info = json.loads(mensaje_str)
+        mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
+        print(f"[DEBUG] formatear_respuesta_firma.mensaje_raw (tipo={type(mensaje_raw)}): {mensaje_raw}")
 
-        person = info.get("person", {}) or info.get("persona", {}) or {}
-        nombre = " ".join(
-            [
-                person.get("nombre1", ""),
-                person.get("nombre2", ""),
-                person.get("apellido1", ""),
-                person.get("apellido2", ""),
-            ]
-        ).strip()
+        # -------------------------------------------------
+        # 1) Normalizar a dict
+        # -------------------------------------------------
+        info = {}
+        if isinstance(mensaje_raw, str):
+            try:
+                info = json.loads(mensaje_raw)
+            except Exception as e:
+                print(f"[ERROR] formatear_respuesta_firma: no se pudo json.loads(mensaje_raw): {e}")
+                # Si no se puede parsear, mostramos el texto crudo
+                return (
+                    "📝 *Resultado de consulta de firma (sin formato JSON)*\n\n"
+                    f"`{mensaje_raw}`"
+                )
+        elif isinstance(mensaje_raw, dict):
+            info = mensaje_raw
+        else:
+            print(f"[DEBUG] formatear_respuesta_firma: mensaje_raw tipo inesperado: {type(mensaje_raw)}")
+            return (
+                "📝 *Resultado de consulta de firma (formato no esperado)*\n\n"
+                f"`{str(mensaje_raw)}`"
+            )
 
-        tipo_doc = person.get("idTipoDoc") or person.get("tipoDocumento") or ""
-        nro_doc = person.get("nroDocumento") or person.get("nroDoc") or ""
+        print(f"[DEBUG] formatear_respuesta_firma.info (tipo={type(info)}): {info}")
 
-        return (
+        # -------------------------------------------------
+        # 2) Intentar formato "viejo": person/persona
+        # -------------------------------------------------
+        person = info.get("person") or info.get("persona") or {}
+        if person:
+            nombre = " ".join(
+                [
+                    person.get("nombre1", ""),
+                    person.get("nombre2", ""),
+                    person.get("apellido1", ""),
+                    person.get("apellido2", ""),
+                ]
+            ).strip()
+            tipo_doc = person.get("idTipoDoc") or person.get("tipoDocumento") or ""
+            nro_doc = person.get("nroDocumento") or person.get("nroDoc") or ""
+        else:
+            # -------------------------------------------------
+            # 3) Formato "nuevo": campos en la raíz
+            # -------------------------------------------------
+            nombres = info.get("nombres") or ""
+            apellidos = info.get("apellidos") or ""
+            nombre = f"{nombres} {apellidos}".strip()
+
+            # A veces no viene el doc en la respuesta de firma, pero igual lo intentamos
+            tipo_doc = (
+                info.get("tipoDocumento")
+                or info.get("idTipoDoc")
+                or info.get("tipoDoc")
+                or ""
+            )
+            nro_doc = (
+                info.get("numeroDocumento")
+                or info.get("nroDocumento")
+                or info.get("nroDoc")
+                or ""
+            )
+
+        grupo = info.get("grupoSanguineo") or "-"
+        sexo = info.get("sexo") or "-"
+        lugar_nac = info.get("lugarNacimiento") or "-"
+
+        fecha_nac_raw = info.get("fechaNacimiento")
+        fecha_nac_fmt = "-"
+        if isinstance(fecha_nac_raw, str) and len(fecha_nac_raw) >= 10:
+            # Tomamos solo la parte YYYY-MM-DD
+            fecha_nac_fmt = fecha_nac_raw[:10]
+
+        texto = (
             "📝 *Resultado de consulta de firma*\n\n"
             f"*Nombre:* {nombre or '-'}\n"
             f"*Documento:* {tipo_doc} {nro_doc}\n"
+            f"*Sexo:* {sexo}\n"
+            f"*Grupo sanguíneo:* {grupo}\n"
+            f"*Fecha de nacimiento:* {fecha_nac_fmt}\n"
+            f"*Lugar de nacimiento:* {lugar_nac}\n"
         )
+
+        print(f"[DEBUG] formatear_respuesta_firma.texto: {texto!r}")
+        return texto
+
     except Exception as e:
         print(f"[ERROR] formateando firma: {e}")
         return textos.MENSAJE_ERROR_GENERICO
+
 
 
 def formatear_respuesta_persona(data: dict) -> str:
