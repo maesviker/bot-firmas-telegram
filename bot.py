@@ -482,7 +482,7 @@ def llamar_iniciar_consulta(tipo_consulta: int, mensaje_payload: Dict[str, Any])
     mensaje_str = json.dumps(mensaje_payload, ensure_ascii=False)
 
     body = {
-        "token": API_TOKEN,          # o HERCULES_TOKEN si así lo llamaste
+        "token": HERCULES_TOKEN,          # o HERCULES_TOKEN si así lo llamaste
         "tipo": tipo_consulta,      # 3, 4, 5, 8, etc.
         "mensaje": mensaje_str,     # JSON serializado como string
     }
