@@ -195,57 +195,42 @@ TIPO_CONSULTA_FIRMA = 8
 
 def init_db() -> None:
     """
-    Crea tablas y se asegura de que existan las configuraciones
-    básicas de consultas. Si alguna falta, la crea.
+    Crea tablas y precarga consultas_config si está vacía.
     """
     Base.metadata.create_all(bind=engine)
 
     db = SessionLocal()
     try:
-        configs_deseadas = [
-            # NUEVO: tipo 1 vehiculo + persona
-            {
-                "tipo_consulta": TIPO_CONSULTA_VEHICULO_PERSONA,
-                "nombre_servicio": "vehiculo_persona",
-                "valor_consulta": 5000,
-                "estado_consulta": "ACTIVA",
-            },
-            # Mantener tipo 3 por compatibilidad (por si lo usas luego)
-            {
-                "tipo_consulta": TIPO_CONSULTA_VEHICULO_SOLO,
-                "nombre_servicio": "vehiculo_placa",
-                "valor_consulta": 5000,
-                "estado_consulta": "ACTIVA",
-            },
-            {
-                "tipo_consulta": TIPO_CONSULTA_PROPIETARIO_POR_PLACA,
-                "nombre_servicio": "propietario_placa",
-                "valor_consulta": 5000,
-                "estado_consulta": "ACTIVA",
-            },
-            {
-                "tipo_consulta": TIPO_CONSULTA_PERSONA,
-                "nombre_servicio": "persona",
-                "valor_consulta": 5000,
-                "estado_consulta": "ACTIVA",
-            },
-            {
-                "tipo_consulta": TIPO_CONSULTA_FIRMA,
-                "nombre_servicio": "firma",
-                "valor_consulta": 5000,
-                "estado_consulta": "ACTIVA",
-            },
+        if db.query(ConsultaConfig).first():
+            return
+
+        configs = [
+            ConsultaConfig(
+                tipo_consulta=TIPO_CONSULTA_VEHICULO_SOLO,
+                nombre_servicio="vehiculo_placa",
+                valor_consulta=5000,
+                estado_consulta="ACTIVA",
+            ),
+            ConsultaConfig(
+                tipo_consulta=TIPO_CONSULTA_PROPIETARIO_POR_PLACA,
+                nombre_servicio="propietario_placa",
+                valor_consulta=5000,
+                estado_consulta="ACTIVA",
+            ),
+            ConsultaConfig(
+                tipo_consulta=TIPO_CONSULTA_PERSONA,
+                nombre_servicio="persona",
+                valor_consulta=5000,
+                estado_consulta="ACTIVA",
+            ),
+            ConsultaConfig(
+                tipo_consulta=TIPO_CONSULTA_FIRMA,
+                nombre_servicio="firma",
+                valor_consulta=5000,
+                estado_consulta="ACTIVA",
+            ),
         ]
-
-        for cfg in configs_deseadas:
-            existente = (
-                db.query(ConsultaConfig)
-                .filter_by(tipo_consulta=cfg["tipo_consulta"])
-                .one_or_none()
-            )
-            if not existente:
-                db.add(ConsultaConfig(**cfg))
-
+        db.add_all(configs)
         db.commit()
     finally:
         db.close()
@@ -743,11 +728,6 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
     datos_vehiculo = vehiculo_info.get("datos", {}) or {}
     adicional = vehiculo_info.get("adicional", {}) or {}
 
-    persona_info = info.get("persona", {}) or {}
-    person = persona_info.get("person", {}) or {}
-    ubic_list = persona_info.get("ubicabilidad") or []
-    ubic = ubic_list[0] if ubic_list else {}
-
     # ==========================
     # 1. Datos vehículo
     # ==========================
@@ -799,37 +779,107 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
     info_veh_dto = adicional.get("informacionVehiculoDTO", {}) or {}
     blindado = info_veh_dto.get("blindado", "-")
 
+    # Lista de comparendos (para licencias y posible fallback de propietario)
+    lista_comparendos = adicional.get("listaComparendos") or []
+
     # ==========================
-    # 2. Propietario
+    # 2. Propietario (natural / jurídica)
     # ==========================
-    nombre_prop = " ".join(
-        [
-            person.get("nombre1", ""),
-            person.get("nombre2", ""),
-            person.get("apellido1", ""),
-            person.get("apellido2", ""),
-        ]
-    ).strip() or "-"
+    persona_info = info.get("persona", {}) or {}
+    person = persona_info.get("person") or {}
+    empresa = persona_info.get("datosEmpresa") or {}
+    direccion_emp = persona_info.get("direccion") or {}
+    ubic_list = persona_info.get("ubicabilidad") or []
+    ubic = ubic_list[0] if ubic_list else {}
+    comparendo_prop = lista_comparendos[0] if lista_comparendos else {}
 
-    prop_tipo_doc = person.get("idTipoDoc") or person.get("tipoDocumento") or "-"
-    prop_num_doc = person.get("nroDocumento") or person.get("numeroDocumento") or "-"
+    nombre_prop = "-"
+    prop_tipo_doc = "-"
+    prop_num_doc = "-"
+    direccion = "-"
+    ciudad = "-"
+    departamento = "-"
+    telefono = "-"
+    correo = "-"
 
-    direccion = ubic.get("direccion", "-")
-    municipio_raw = ubic.get("municipio", "") or "-"
-    if " - " in municipio_raw:
-        ciudad, departamento = [x.strip() for x in municipio_raw.split(" - ", 1)]
-    else:
-        ciudad = municipio_raw
-        departamento = "-"
+    if person:
+        # Persona natural
+        nombre_prop = " ".join(
+            [
+                person.get("nombre1", ""),
+                person.get("nombre2", ""),
+                person.get("apellido1", ""),
+                person.get("apellido2", ""),
+            ]
+        ).strip() or "-"
 
-    telefono = ubic.get("telefono") or person.get("celular") or "-"
-    correo = ubic.get("correoElectronico") or person.get("email") or "-"
+        prop_tipo_doc = person.get("idTipoDoc") or person.get("tipoDocumento") or "-"
+        prop_num_doc = person.get("nroDocumento") or person.get("numeroDocumento") or "-"
+
+        direccion = ubic.get("direccion") or direccion_emp.get("direccion") or "-"
+        telefono = (
+            ubic.get("telefono")
+            or person.get("celular")
+            or direccion_emp.get("telefono")
+            or direccion_emp.get("celular")
+            or "-"
+        )
+        correo = (
+            ubic.get("correoElectronico")
+            or person.get("email")
+            or direccion_emp.get("email")
+            or "-"
+        )
+
+        municipio_raw = ubic.get("municipio", "") or "-"
+        if " - " in municipio_raw:
+            ciudad, departamento = [x.strip() for x in municipio_raw.split(" - ", 1)]
+        else:
+            ciudad = municipio_raw
+            departamento = "-"
+
+    elif empresa:
+        # Persona jurídica / empresa
+        nombre_prop = (
+            empresa.get("razonSocial")
+            or empresa.get("nombreCorto")
+            or "-"
+        )
+        prop_tipo_doc = (
+            empresa.get("tipoDocumentoEmpresa")
+            or empresa.get("tipoDocumentoId")
+            or "NIT"
+        )
+        prop_num_doc = (
+            empresa.get("numeroDocumentoEmpresa")
+            or empresa.get("nroDocumento")
+            or "-"
+        )
+
+        direccion = direccion_emp.get("direccion") or "-"
+        ciudad = (
+            direccion_emp.get("municipio")
+            or empresa.get("municipio")
+            or "-"
+        )
+        departamento = (
+            direccion_emp.get("departamento")
+            or empresa.get("departamento")
+            or "-"
+        )
+        telefono = direccion_emp.get("telefono") or direccion_emp.get("celular") or "-"
+        correo = direccion_emp.get("email") or "-"
+
+    elif comparendo_prop:
+        # Fallback desde listaComparendos (cuando no viene ni person ni datosEmpresa)
+        nombre_prop = comparendo_prop.get("nombrePropietario") or "-"
+        prop_tipo_doc = comparendo_prop.get("tipoIdentidadPropietario") or "-"
+        prop_num_doc = comparendo_prop.get("numeroIdentidadPropietario") or "-"
 
     # ==========================
     # 3. Licencias
     # ==========================
     licencias_list = []
-    lista_comparendos = adicional.get("listaComparendos") or []
     if lista_comparendos:
         comp = lista_comparendos[0]
         for lic in comp.get("listaLicencias") or []:
@@ -872,7 +922,22 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
     inscrito_runt = datos_vehiculo.get("vehiculoInscritoRUNT", "-")
     gravamenes = datos_vehiculo.get("poseeGravamenes", "-")
     tarjeta_servicios = datos_vehiculo.get("numeroTarjetaServicios", "-")
-    tarjeta_vence = datos_vehiculo.get("fechaVencimientoTarjetaServicios", "-") or "-"
+
+    # --- NUEVO: Vigencia tarjeta en formato corto dd/MM/yyyy ---
+    tarjeta_vence_raw = datos_vehiculo.get("fechaVencimientoTarjetaServicios")
+    tarjeta_vence = "-"
+    if isinstance(tarjeta_vence_raw, str) and tarjeta_vence_raw:
+        try:
+            try:
+                dt_tv = datetime.fromisoformat(tarjeta_vence_raw.replace("Z", "+00:00"))
+            except ValueError:
+                # Tomamos solo la parte de fecha YYYY-MM-DD
+                dt_tv = datetime.strptime(tarjeta_vence_raw[:10], "%Y-%m-%d")
+            tarjeta_vence = dt_tv.strftime("%d/%m/%Y")
+        except Exception:
+            tarjeta_vence = tarjeta_vence_raw[:10]
+    else:
+        tarjeta_vence = "-"
 
     # ==========================
     # 5. Estilos ReportLab
@@ -897,11 +962,20 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
         fontSize=8,
     )
 
+    tiny_style = ParagraphStyle(
+        name="Tiny",
+        parent=styles["Normal"],
+        fontSize=7,
+    )
+
     def cell(t):
         return Paragraph(str(t if t is not None else "-"), normal_style)
 
     def cell_small(t):
         return Paragraph(str(t if t is not None else "-"), small_style)
+
+    def cell_tiny(t):
+        return Paragraph(str(t if t is not None else "-"), tiny_style)
 
     # ==========================
     # 6. QR en imagen temporal
@@ -971,11 +1045,12 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
     story.append(tabla_propietario)
     story.append(Spacer(1, 4))
 
+    # --- NUEVO: Dirección y Correo en letra más pequeña (8 pt) ---
     tabla_ubicacion = Table(
         [
             [cell("Departamento"), cell(departamento), cell("Ciudad"), cell(ciudad)],
-            [cell("Dirección"), cell(direccion), cell("Teléfono"), cell(telefono)],
-            [cell("Correo"), cell(correo), cell(""), cell("")],
+            [cell("Dirección"), cell_small(direccion), cell("Teléfono"), cell(telefono)],
+            [cell("Correo"), cell_small(correo), cell(""), cell("")],
         ],
         colWidths=[total_width / 4] * 4,
     )
@@ -1028,7 +1103,9 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
             )
         tabla_lic = Table(
             lic_rows,
-            colWidths=[
+            colWidths[
+                :
+            ] if False else [
                 total_width * 0.18,
                 total_width * 0.12,
                 total_width * 0.20,
@@ -1127,7 +1204,7 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
             cell_small("No. Póliza"),
             cell_small("Fecha inicio vigencia"),
             cell_small("Fecha fin vigencia"),
-            cell_small("Entidad que expide SOAT"),
+            cell_tiny("Entidad que expide SOAT"),
             cell_small("Vigente"),
         ]
         soat_rows = [soat_header]
@@ -1137,7 +1214,7 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
                     cell_small(pol.get("numeroPoliza", "-")),
                     cell_small(pol.get("fechaInicio", "-")),
                     cell_small(pol.get("fechaVencimiento", "-")),
-                    cell_small(pol.get("aseguradora", "-")),
+                    cell_tiny(pol.get("aseguradora", "-")),  # texto largo más pequeño
                     cell_small(calcular_vigente(pol.get("fechaVencimiento", "-"))),
                 ]
             )
@@ -1181,20 +1258,20 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
         story.append(tabla_rtm_title)
 
         rtm_header = [
-            cell_small("Tipo de revisión"),
+            cell_tiny("Tipo de revisión"),
             cell_small("Fecha expedición"),
             cell_small("Fecha vigencia"),
-            cell_small("CDA expide RTM"),
+            cell_tiny("CDA expide RTM"),
             cell_small("Vigente"),
         ]
         rtm_rows = [rtm_header]
         for r in rtm_list:
             rtm_rows.append(
                 [
-                    cell_small(r.get("tipoRevision", "-")),
+                    cell_tiny(r.get("tipoRevision", "-")),
                     cell_small(r.get("fechaExpedicion", "-")),
                     cell_small(r.get("fechaVigencia", "-")),
-                    cell_small(r.get("nombreCda", "-")),
+                    cell_tiny(r.get("nombreCda", "-")),
                     cell_small(calcular_vigente(r.get("fechaVigencia", "-"))),
                 ]
             )
@@ -1571,13 +1648,15 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
         ultima_poliza = soat_list[0] if soat_list else None
         ultima_rtm = lista_rtm[0] if lista_rtm else None
 
-        # Propietario (si viene en el JSON con persona)
+        # Propietario (natural / jurídica con fallback)
         nombre_prop = "-"
         tipo_doc_prop = "-"
         nro_doc_prop = "-"
 
         persona_info = info.get("persona") or {}
         person = persona_info.get("person") or {}
+        empresa = persona_info.get("datosEmpresa") or info.get("datosEmpresa") or {}
+
         if person:
             nombre_prop = " ".join(
                 [
@@ -1589,6 +1668,29 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
             ).strip() or "-"
             tipo_doc_prop = person.get("idTipoDoc") or person.get("tipoDocumento") or "-"
             nro_doc_prop = person.get("nroDocumento") or person.get("numeroDocumento") or "-"
+        elif empresa:
+            nombre_prop = (
+                empresa.get("razonSocial")
+                or empresa.get("nombreCorto")
+                or "-"
+            )
+            tipo_doc_prop = (
+                empresa.get("tipoDocumentoEmpresa")
+                or empresa.get("tipoDocumentoId")
+                or "NIT"
+            )
+            nro_doc_prop = (
+                empresa.get("numeroDocumentoEmpresa")
+                or empresa.get("nroDocumento")
+                or "-"
+            )
+        else:
+            lista_comparendos_prop = adicional.get("listaComparendos") or []
+            if lista_comparendos_prop:
+                comp0 = lista_comparendos_prop[0]
+                nombre_prop = comp0.get("nombrePropietario") or "-"
+                tipo_doc_prop = comp0.get("tipoIdentidadPropietario") or "-"
+                nro_doc_prop = comp0.get("numeroIdentidadPropietario") or "-"
 
         # Accidentes y licencias
         lista_accidentes = adicional.get("listaAccidentes") or []
@@ -1625,7 +1727,7 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
         partes.append(f"• Estado del registro: {estado_registro}")
         partes.append("")
 
-        # 2. Características del vehículo (una sola etiqueta por línea)
+        # 2. Características del vehículo
         partes.append("*2. Características del vehículo*")
         partes.append(f"• Marca: {marca}")
         partes.append(f"• Línea: {linea}")
@@ -1825,13 +1927,12 @@ def iniciar_consulta_persona(usuario: Usuario, chat_id: int, tipo_doc: str, num_
 
 def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
     """
-    Consulta de vehículo por placa.
-
-    AHORA: se hace con el tipo 1 (TIPO_CONSULTA_VEHICULO_PERSONA)
-    para obtener vehículo + datos de persona y con eso generar el PDF.
-    La API espera solo la placa como string.
+    Consulta de vehículo por placa (tipo 3).
+    En IniciarConsulta la API espera:
+      "mensaje": "PDK400"
+    (solo la placa, no JSON).
     """
-    config = get_consulta_config(TIPO_CONSULTA_VEHICULO_PERSONA)
+    config = get_consulta_config(TIPO_CONSULTA_VEHICULO_SOLO)
     if not _verificar_creditos_o_mensaje(chat_id, usuario, config):
         return
 
@@ -1839,7 +1940,7 @@ def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
     mensaje_payload = placa_limpia
 
     try:
-        id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_VEHICULO_PERSONA, mensaje_payload)
+        id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_VEHICULO_SOLO, mensaje_payload)
     except Exception as e:
         print(f"[ERROR] iniciar_consulta_vehiculo -> IniciarConsulta: {e}")
         enviar_mensaje(chat_id, textos.MENSAJE_ERROR_GENERICO)
@@ -1847,17 +1948,18 @@ def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
 
     msg_id = registrar_mensaje_pendiente(
         usuario=usuario,
-        tipo_consulta=TIPO_CONSULTA_VEHICULO_PERSONA,
-        nombre_servicio="vehiculo_persona",
+        tipo_consulta=TIPO_CONSULTA_VEHICULO_SOLO,
+        nombre_servicio="vehiculo_placa",
         parametros={"placa": placa_limpia},
         valor_consulta=config.valor_consulta,
     )
 
+    # Corregido: solo el llamado correcto sin identificador suelto
     ejecutar_consulta_en_hilo(
         chat_id=chat_id,
         usuario=usuario,
         mensaje_id=msg_id,
-        tipo_consulta=TIPO_CONSULTA_VEHICULO_PERSONA,
+        tipo_consulta=TIPO_CONSULTA_VEHICULO_SOLO,
         mensaje_parametro_str=placa_limpia,
         id_peticion=id_peticion,
         formateador_respuesta=formatear_respuesta_vehiculo,
@@ -1918,8 +2020,6 @@ def ejecutar_consulta_en_hilo(
     Hilo que hace polling a /resultados y decide si se cobra o no.
     Ahora también permite que, en caso de consulta de vehículo,
     se genere y envíe un PDF con el informe vehicular.
-
-    Para el PDF se utiliza ahora el tipo 1 (vehículo + persona).
     """
 
     def _run():
@@ -1985,8 +2085,8 @@ def ejecutar_consulta_en_hilo(
                 if firma_b64:
                     enviar_documento_firma_desde_b64(chat_id, firma_b64)
 
-                # === NUEVO: si es consulta de vehículo (tipo 1 o 3), generamos y enviamos PDF ===
-                if tipo_consulta in (TIPO_CONSULTA_VEHICULO_PERSONA, TIPO_CONSULTA_VEHICULO_SOLO):
+                # === Si es consulta de vehículo, generamos y enviamos PDF ===
+                if tipo_consulta == TIPO_CONSULTA_VEHICULO_SOLO:
                     try:
                         # Intentamos extraer la placa para usarla en el nombre del archivo
                         placa_para_nombre = "VEHICULO"
@@ -2039,6 +2139,7 @@ def ejecutar_consulta_en_hilo(
 # =====================================================================
 
 app = Flask(__name__)
+
 
 
 @app.route(f"/webhook/{WEBHOOK_SECRET_PATH}", methods=["POST"])
