@@ -728,6 +728,13 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
     datos_vehiculo = vehiculo_info.get("datos", {}) or {}
     adicional = vehiculo_info.get("adicional", {}) or {}
 
+    persona_info = info.get("persona", {}) or {}
+    person = persona_info.get("person", {}) or {}
+    datos_empresa = persona_info.get("datosEmpresa") or {}
+    dir_empresa = persona_info.get("direccion") or {}
+    ubic_list = persona_info.get("ubicabilidad") or []
+    ubic = ubic_list[0] if ubic_list else {}
+
     # ==========================
     # 1. Datos vehículo
     # ==========================
@@ -779,31 +786,11 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
     info_veh_dto = adicional.get("informacionVehiculoDTO", {}) or {}
     blindado = info_veh_dto.get("blindado", "-")
 
-    # Lista de comparendos (para licencias y posible fallback de propietario)
-    lista_comparendos = adicional.get("listaComparendos") or []
-
     # ==========================
-    # 2. Propietario (natural / jurídica)
+    # 2. Propietario
     # ==========================
-    persona_info = info.get("persona", {}) or {}
-    person = persona_info.get("person") or {}
-    empresa = persona_info.get("datosEmpresa") or {}
-    direccion_emp = persona_info.get("direccion") or {}
-    ubic_list = persona_info.get("ubicabilidad") or []
-    ubic = ubic_list[0] if ubic_list else {}
-    comparendo_prop = lista_comparendos[0] if lista_comparendos else {}
-
-    nombre_prop = "-"
-    prop_tipo_doc = "-"
-    prop_num_doc = "-"
-    direccion = "-"
-    ciudad = "-"
-    departamento = "-"
-    telefono = "-"
-    correo = "-"
-
+    # Persona natural
     if person:
-        # Persona natural
         nombre_prop = " ".join(
             [
                 person.get("nombre1", ""),
@@ -812,74 +799,67 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
                 person.get("apellido2", ""),
             ]
         ).strip() or "-"
-
         prop_tipo_doc = person.get("idTipoDoc") or person.get("tipoDocumento") or "-"
         prop_num_doc = person.get("nroDocumento") or person.get("numeroDocumento") or "-"
-
-        direccion = ubic.get("direccion") or direccion_emp.get("direccion") or "-"
-        telefono = (
-            ubic.get("telefono")
-            or person.get("celular")
-            or direccion_emp.get("telefono")
-            or direccion_emp.get("celular")
-            or "-"
-        )
-        correo = (
-            ubic.get("correoElectronico")
-            or person.get("email")
-            or direccion_emp.get("email")
-            or "-"
-        )
-
-        municipio_raw = ubic.get("municipio", "") or "-"
-        if " - " in municipio_raw:
-            ciudad, departamento = [x.strip() for x in municipio_raw.split(" - ", 1)]
-        else:
-            ciudad = municipio_raw
-            departamento = "-"
-
-    elif empresa:
-        # Persona jurídica / empresa
-        nombre_prop = (
-            empresa.get("razonSocial")
-            or empresa.get("nombreCorto")
-            or "-"
-        )
+    # Persona jurídica (empresa)
+    elif datos_empresa:
+        nombre_prop = datos_empresa.get("razonSocial") or "-"
         prop_tipo_doc = (
-            empresa.get("tipoDocumentoEmpresa")
-            or empresa.get("tipoDocumentoId")
+            datos_empresa.get("tipoDocumentoEmpresa")
+            or datos_empresa.get("tipoDocumentoId")
             or "NIT"
         )
         prop_num_doc = (
-            empresa.get("numeroDocumentoEmpresa")
-            or empresa.get("nroDocumento")
+            datos_empresa.get("numeroDocumentoEmpresa")
+            or datos_empresa.get("nroDocumento")
             or "-"
         )
+    else:
+        nombre_prop = "-"
+        prop_tipo_doc = "-"
+        prop_num_doc = "-"
 
-        direccion = direccion_emp.get("direccion") or "-"
-        ciudad = (
-            direccion_emp.get("municipio")
-            or empresa.get("municipio")
-            or "-"
-        )
-        departamento = (
-            direccion_emp.get("departamento")
-            or empresa.get("departamento")
-            or "-"
-        )
-        telefono = direccion_emp.get("telefono") or direccion_emp.get("celular") or "-"
-        correo = direccion_emp.get("email") or "-"
+    # Dirección y contacto (natural o jurídica)
+    direccion = (
+        ubic.get("direccion")
+        or dir_empresa.get("direccion")
+        or "-"
+    )
 
-    elif comparendo_prop:
-        # Fallback desde listaComparendos (cuando no viene ni person ni datosEmpresa)
-        nombre_prop = comparendo_prop.get("nombrePropietario") or "-"
-        prop_tipo_doc = comparendo_prop.get("tipoIdentidadPropietario") or "-"
-        prop_num_doc = comparendo_prop.get("numeroIdentidadPropietario") or "-"
+    municipio_raw = (
+        ubic.get("municipio")
+        or (
+            (datos_empresa.get("municipio") and datos_empresa.get("departamento"))
+            and f"{datos_empresa['municipio']} - {datos_empresa['departamento']}"
+        )
+        or "-"
+    )
+
+    if " - " in municipio_raw:
+        ciudad, departamento = [x.strip() for x in municipio_raw.split(" - ", 1)]
+    else:
+        ciudad = municipio_raw
+        departamento = "-"
+
+    telefono = (
+        ubic.get("telefono")
+        or dir_empresa.get("telefono")
+        or dir_empresa.get("celular")
+        or person.get("celular")
+        or "-"
+    )
+    correo = (
+        ubic.get("correoElectronico")
+        or dir_empresa.get("email")
+        or person.get("email")
+        or "-"
+    )
 
     # ==========================
     # 3. Licencias
     # ==========================
     licencias_list = []
+    lista_comparendos = adicional.get("listaComparendos") or []
     if lista_comparendos:
         comp = lista_comparendos[0]
         for lic in comp.get("listaLicencias") or []:
@@ -923,21 +903,11 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
     gravamenes = datos_vehiculo.get("poseeGravamenes", "-")
     tarjeta_servicios = datos_vehiculo.get("numeroTarjetaServicios", "-")
 
-    # --- NUEVO: Vigencia tarjeta en formato corto dd/MM/yyyy ---
+    # Vigencia tarjeta -> fecha corta
     tarjeta_vence_raw = datos_vehiculo.get("fechaVencimientoTarjetaServicios")
     tarjeta_vence = "-"
-    if isinstance(tarjeta_vence_raw, str) and tarjeta_vence_raw:
-        try:
-            try:
-                dt_tv = datetime.fromisoformat(tarjeta_vence_raw.replace("Z", "+00:00"))
-            except ValueError:
-                # Tomamos solo la parte de fecha YYYY-MM-DD
-                dt_tv = datetime.strptime(tarjeta_vence_raw[:10], "%Y-%m-%d")
-            tarjeta_vence = dt_tv.strftime("%d/%m/%Y")
-        except Exception:
-            tarjeta_vence = tarjeta_vence_raw[:10]
-    else:
-        tarjeta_vence = "-"
+    if isinstance(tarjeta_vence_raw, str) and len(tarjeta_vence_raw) >= 10:
+        tarjeta_vence = tarjeta_vence_raw[:10]
 
     # ==========================
     # 5. Estilos ReportLab
@@ -962,20 +932,11 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
         fontSize=8,
     )
 
-    tiny_style = ParagraphStyle(
-        name="Tiny",
-        parent=styles["Normal"],
-        fontSize=7,
-    )
-
     def cell(t):
         return Paragraph(str(t if t is not None else "-"), normal_style)
 
     def cell_small(t):
         return Paragraph(str(t if t is not None else "-"), small_style)
-
-    def cell_tiny(t):
-        return Paragraph(str(t if t is not None else "-"), tiny_style)
 
     # ==========================
     # 6. QR en imagen temporal
@@ -1045,7 +1006,7 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
     story.append(tabla_propietario)
     story.append(Spacer(1, 4))
 
-    # --- NUEVO: Dirección y Correo en letra más pequeña (8 pt) ---
+    # Dirección y correo con letra más pequeña
     tabla_ubicacion = Table(
         [
             [cell("Departamento"), cell(departamento), cell("Ciudad"), cell(ciudad)],
@@ -1204,7 +1165,7 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
             cell_small("No. Póliza"),
             cell_small("Fecha inicio vigencia"),
             cell_small("Fecha fin vigencia"),
-            cell_tiny("Entidad que expide SOAT"),
+            cell_small("Entidad que expide SOAT"),
             cell_small("Vigente"),
         ]
         soat_rows = [soat_header]
@@ -1214,7 +1175,7 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
                     cell_small(pol.get("numeroPoliza", "-")),
                     cell_small(pol.get("fechaInicio", "-")),
                     cell_small(pol.get("fechaVencimiento", "-")),
-                    cell_tiny(pol.get("aseguradora", "-")),  # texto largo más pequeño
+                    cell_small(pol.get("aseguradora", "-")),
                     cell_small(calcular_vigente(pol.get("fechaVencimiento", "-"))),
                 ]
             )
@@ -1258,20 +1219,20 @@ def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/Quan
         story.append(tabla_rtm_title)
 
         rtm_header = [
-            cell_tiny("Tipo de revisión"),
+            cell_small("Tipo de revisión"),
             cell_small("Fecha expedición"),
             cell_small("Fecha vigencia"),
-            cell_tiny("CDA expide RTM"),
+            cell_small("CDA expide RTM"),
             cell_small("Vigente"),
         ]
         rtm_rows = [rtm_header]
         for r in rtm_list:
             rtm_rows.append(
                 [
-                    cell_tiny(r.get("tipoRevision", "-")),
+                    cell_small(r.get("tipoRevision", "-")),
                     cell_small(r.get("fechaExpedicion", "-")),
                     cell_small(r.get("fechaVigencia", "-")),
-                    cell_tiny(r.get("nombreCda", "-")),
+                    cell_small(r.get("nombreCda", "-")),
                     cell_small(calcular_vigente(r.get("fechaVigencia", "-"))),
                 ]
             )
@@ -1648,14 +1609,14 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
         ultima_poliza = soat_list[0] if soat_list else None
         ultima_rtm = lista_rtm[0] if lista_rtm else None
 
-        # Propietario (natural / jurídica con fallback)
+        # Propietario (persona natural / jurídica / fallback)
         nombre_prop = "-"
         tipo_doc_prop = "-"
         nro_doc_prop = "-"
 
         persona_info = info.get("persona") or {}
         person = persona_info.get("person") or {}
-        empresa = persona_info.get("datosEmpresa") or info.get("datosEmpresa") or {}
+        datos_empresa = persona_info.get("datosEmpresa") or {}
 
         if person:
             nombre_prop = " ".join(
@@ -1668,26 +1629,23 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
             ).strip() or "-"
             tipo_doc_prop = person.get("idTipoDoc") or person.get("tipoDocumento") or "-"
             nro_doc_prop = person.get("nroDocumento") or person.get("numeroDocumento") or "-"
-        elif empresa:
-            nombre_prop = (
-                empresa.get("razonSocial")
-                or empresa.get("nombreCorto")
-                or "-"
-            )
+        elif datos_empresa:
+            nombre_prop = datos_empresa.get("razonSocial") or "-"
             tipo_doc_prop = (
-                empresa.get("tipoDocumentoEmpresa")
-                or empresa.get("tipoDocumentoId")
+                datos_empresa.get("tipoDocumentoEmpresa")
+                or datos_empresa.get("tipoDocumentoId")
                 or "NIT"
             )
             nro_doc_prop = (
-                empresa.get("numeroDocumentoEmpresa")
-                or empresa.get("nroDocumento")
+                datos_empresa.get("numeroDocumentoEmpresa")
+                or datos_empresa.get("nroDocumento")
                 or "-"
             )
         else:
-            lista_comparendos_prop = adicional.get("listaComparendos") or []
-            if lista_comparendos_prop:
-                comp0 = lista_comparendos_prop[0]
+            # Fallback desde listaComparendos (si viene allí)
+            lista_comparendos_local = adicional.get("listaComparendos") or []
+            if lista_comparendos_local:
+                comp0 = lista_comparendos_local[0]
                 nombre_prop = comp0.get("nombrePropietario") or "-"
                 tipo_doc_prop = comp0.get("tipoIdentidadPropietario") or "-"
                 nro_doc_prop = comp0.get("numeroIdentidadPropietario") or "-"
@@ -1727,7 +1685,7 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
         partes.append(f"• Estado del registro: {estado_registro}")
         partes.append("")
 
-        # 2. Características del vehículo
+        # 2. Características del vehículo (una sola etiqueta por línea)
         partes.append("*2. Características del vehículo*")
         partes.append(f"• Marca: {marca}")
         partes.append(f"• Línea: {linea}")
@@ -1893,14 +1851,23 @@ def iniciar_consulta_firma(usuario: Usuario, chat_id: int, tipo_doc: str, num_do
 
 
 def iniciar_consulta_persona(usuario: Usuario, chat_id: int, tipo_doc: str, num_doc: str):
+    """
+    Para tipo 5, la API también espera:
+      "mensaje": "CC,15645123"
+    (NO JSON).
+    """
     config = get_consulta_config(TIPO_CONSULTA_PERSONA)
     if not _verificar_creditos_o_mensaje(chat_id, usuario, config):
         return
 
-    mensaje_payload = {"tipoDocumento": tipo_doc, "numeroDocumento": num_doc}
+    # Formato requerido por la API (igual que en Postman)
+    mensaje_param_api = f"{tipo_doc},{num_doc}"
+
+    # Parámetros “bonitos” para guardar en BD
+    parametros_guardar = {"tipoDocumento": tipo_doc, "numeroDocumento": num_doc}
 
     try:
-        id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_PERSONA, mensaje_payload)
+        id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_PERSONA, mensaje_param_api)
     except Exception as e:
         print(f"[ERROR] iniciar_consulta_persona -> IniciarConsulta: {e}")
         enviar_mensaje(chat_id, textos.MENSAJE_ERROR_GENERICO)
@@ -1910,7 +1877,7 @@ def iniciar_consulta_persona(usuario: Usuario, chat_id: int, tipo_doc: str, num_
         usuario=usuario,
         tipo_consulta=TIPO_CONSULTA_PERSONA,
         nombre_servicio="persona",
-        parametros=mensaje_payload,
+        parametros=parametros_guardar,
         valor_consulta=config.valor_consulta,
     )
 
@@ -1919,7 +1886,7 @@ def iniciar_consulta_persona(usuario: Usuario, chat_id: int, tipo_doc: str, num_
         usuario=usuario,
         mensaje_id=msg_id,
         tipo_consulta=TIPO_CONSULTA_PERSONA,
-        mensaje_parametro_str=json.dumps(mensaje_payload, ensure_ascii=False),
+        mensaje_parametro_str=mensaje_param_api,
         id_peticion=id_peticion,
         formateador_respuesta=formatear_respuesta_persona,
     )
@@ -1954,7 +1921,6 @@ def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
         valor_consulta=config.valor_consulta,
     )
 
-    # Corregido: solo el llamado correcto sin identificador suelto
     ejecutar_consulta_en_hilo(
         chat_id=chat_id,
         usuario=usuario,
@@ -2139,7 +2105,6 @@ def ejecutar_consulta_en_hilo(
 # =====================================================================
 
 app = Flask(__name__)
-
 
 
 @app.route(f"/webhook/{WEBHOOK_SECRET_PATH}", methods=["POST"])
