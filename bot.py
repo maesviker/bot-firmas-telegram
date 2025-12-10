@@ -1,3 +1,1160 @@
+import os
+import json
+import time
+import threading
+import base64
+import io
+from datetime import datetime
+from typing import Optional, Dict, Any
+
+import requests
+from flask import Flask, request, jsonify
+
+# SQLAlchemy para base de datos
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    Text,
+    DateTime,
+    ForeignKey,
+)
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+
+# ReportLab y QR
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    PageBreak,
+)
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+import qrcode
+
+# =====================================================================
+# 1. CONFIGURACIÓN GENERAL
+# =====================================================================
+
+# ---------------------------------------------------------------
+# 1.1 TOKEN DEL BOT DE TELEGRAM
+# ---------------------------------------------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError(
+        "Falta TELEGRAM_TOKEN en variables de entorno.\n"
+        "Configúralo en tu entorno local y en Railway."
+    )
+
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+# Ruta de webhook: por defecto usamos el token (puedes cambiarla)
+WEBHOOK_SECRET_PATH = os.getenv("WEBHOOK_SECRET_PATH", TELEGRAM_TOKEN)
+
+# ---------------------------------------------------------------
+# 1.2 CONFIGURACIÓN API HÉRCULES
+# ---------------------------------------------------------------
+# Token de usuario asignado por Hércules (ej. 'mvk')
+HERCULES_TOKEN = os.getenv("HERCULES_TOKEN")
+if not HERCULES_TOKEN:
+    raise RuntimeError(
+        "Falta HERCULES_TOKEN en variables de entorno.\n"
+        "Configúralo con el token de la API Hércules (ej. 'mvk')."
+    )
+
+# URL base de la API Hércules
+API_BASE = os.getenv(
+    "HERCULES_BASE_URL",
+    "https://solutechherculesazf.azurewebsites.net",
+)
+
+# Intervalo entre consultas a /resultados (segundos)
+RESULTADOS_INTERVALO = int(os.getenv("RESULTADOS_INTERVALO", "4"))
+# Tiempo máximo de espera total para resultados (segundos)
+RESULTADOS_TIMEOUT = int(os.getenv("RESULTADOS_TIMEOUT", "180"))
+
+# ---------------------------------------------------------------
+# 1.3 CONFIGURACIÓN BASE DE DATOS
+# ---------------------------------------------------------------
+Base = declarative_base()
+
+local_db_name = os.getenv("LOCAL_DB_NAME", "bot_hercules.db")
+local_sqlite_url = f"sqlite:///{local_db_name}"
+
+DATABASE_URL = (
+    os.getenv("DATABASE_URL")
+    or os.getenv("MYSQL_URL")
+    or local_sqlite_url
+)
+
+# Ajuste de dialecto para MySQL -> mysql+pymysql
+if DATABASE_URL.startswith("mysql://"):
+    DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+pymysql://", 1)
+
+# Charset para MySQL
+if DATABASE_URL.startswith("mysql+pymysql://") and "charset=" not in DATABASE_URL:
+    sep = "&" if "?" in DATABASE_URL else "?"
+    DATABASE_URL = f"{DATABASE_URL}{sep}charset=utf8mb4"
+
+engine = create_engine(DATABASE_URL, echo=False, future=True)
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+# =====================================================================
+# 2. MODELOS DE BASE DE DATOS
+# =====================================================================
+
+class Usuario(Base):
+    """
+    Usuario de Telegram que usa el bot.
+    """
+    __tablename__ = "usuarios"
+
+    id = Column(Integer, primary_key=True, index=True)
+    telegram_id = Column(String(64), unique=True, nullable=False, index=True)
+    username = Column(String(64), nullable=True)
+    first_name = Column(String(64), nullable=True)
+    last_name = Column(String(64), nullable=True)
+
+    rol = Column(String(32), default="user", nullable=False)
+
+    # Créditos totales que tiene el usuario (inicialmente 10)
+    creditos_total = Column(Integer, default=10, nullable=False)
+    # Créditos que ya ha consumido en consultas exitosas
+    creditos_usados = Column(Integer, default=0, nullable=False)
+
+    ultima_consulta = Column(DateTime, nullable=True)
+
+    mensajes = relationship("Mensaje", back_populates="usuario")
+
+
+class Mensaje(Base):
+    """
+    Registro de cada consulta hecha por un usuario.
+    """
+    __tablename__ = "mensajes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    usuario_id = Column(Integer, ForeignKey("usuarios.id"), nullable=False)
+
+    # Tipo de consulta Hércules (1..8)
+    tipo_consulta = Column(Integer, nullable=False)
+
+    # Nombre del servicio lógico (firma, persona, vehiculo_placa, etc.)
+    nombre_servicio = Column(String(50), nullable=False)
+
+    # Parámetros enviados (JSON serializado)
+    parametros = Column(Text, nullable=True)
+
+    # Cuánto costaría esta consulta (en créditos)
+    creditos_costo = Column(Integer, default=0, nullable=False)
+
+    # pendiente | exito | error | sin_datos
+    estado = Column(String(20), default="pendiente", nullable=False)
+
+    respuesta_bruta = Column(Text, nullable=True)
+    mensaje_error = Column(Text, nullable=True)
+
+    fecha_creacion = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    usuario = relationship("Usuario", back_populates="mensajes")
+
+
+class ConsultaConfig(Base):
+    """
+    Configuración por tipo de consulta:
+      - valor_consulta
+      - estado_consulta (ACTIVA / INACTIVA)
+    """
+    __tablename__ = "consultas_config"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tipo_consulta = Column(Integer, unique=True, nullable=False)
+    nombre_servicio = Column(String(50), nullable=False)
+    valor_consulta = Column(Integer, default=5000, nullable=False)
+    estado_consulta = Column(String(20), default="ACTIVA", nullable=False)
+
+# =====================================================================
+# 3. CONSTANTES DE TIPO DE CONSULTA (CATÁLOGO HÉRCULES)
+# =====================================================================
+
+TIPO_CONSULTA_VEHICULO_PERSONA = 1
+TIPO_CONSULTA_VEHICULO_CHASIS = 2
+TIPO_CONSULTA_VEHICULO_SOLO = 3
+TIPO_CONSULTA_PROPIETARIO_POR_PLACA = 4
+TIPO_CONSULTA_PERSONA = 5
+TIPO_CONSULTA_FIRMA = 8
+
+# =====================================================================
+# 4. INICIALIZACIÓN DE BD
+# =====================================================================
+
+def init_db() -> None:
+    """
+    Crea tablas y se asegura de que existan las configuraciones
+    básicas de consultas. Si alguna falta, la crea.
+    """
+    Base.metadata.create_all(bind=engine)
+
+    db = SessionLocal()
+    try:
+        configs_deseadas = [
+            # NUEVO: tipo 1 vehiculo + persona
+            {
+                "tipo_consulta": TIPO_CONSULTA_VEHICULO_PERSONA,
+                "nombre_servicio": "vehiculo_persona",
+                "valor_consulta": 5000,
+                "estado_consulta": "ACTIVA",
+            },
+            # Mantener tipo 3 por compatibilidad (por si lo usas luego)
+            {
+                "tipo_consulta": TIPO_CONSULTA_VEHICULO_SOLO,
+                "nombre_servicio": "vehiculo_placa",
+                "valor_consulta": 5000,
+                "estado_consulta": "ACTIVA",
+            },
+            {
+                "tipo_consulta": TIPO_CONSULTA_PROPIETARIO_POR_PLACA,
+                "nombre_servicio": "propietario_placa",
+                "valor_consulta": 5000,
+                "estado_consulta": "ACTIVA",
+            },
+            {
+                "tipo_consulta": TIPO_CONSULTA_PERSONA,
+                "nombre_servicio": "persona",
+                "valor_consulta": 5000,
+                "estado_consulta": "ACTIVA",
+            },
+            {
+                "tipo_consulta": TIPO_CONSULTA_FIRMA,
+                "nombre_servicio": "firma",
+                "valor_consulta": 5000,
+                "estado_consulta": "ACTIVA",
+            },
+        ]
+
+        for cfg in configs_deseadas:
+            existente = (
+                db.query(ConsultaConfig)
+                .filter_by(tipo_consulta=cfg["tipo_consulta"])
+                .one_or_none()
+            )
+            if not existente:
+                db.add(ConsultaConfig(**cfg))
+
+        db.commit()
+    finally:
+        db.close()
+
+
+init_db()
+
+# =====================================================================
+# 5. FUNCIONES AUXILIARES DE BD
+# =====================================================================
+
+def get_db():
+    return SessionLocal()
+
+
+def get_or_create_usuario_from_update(update: dict) -> Usuario:
+    """
+    Localiza o crea el usuario de Telegram que envía el mensaje.
+    """
+    message = update.get("message") or update.get("edited_message")
+    if not message:
+        raise ValueError("Update sin message ni edited_message")
+
+    from_user = message["from"]
+    telegram_id = str(from_user["id"])
+
+    db = get_db()
+    try:
+        usuario = db.query(Usuario).filter_by(telegram_id=telegram_id).one_or_none()
+        if usuario:
+            usuario.username = from_user.get("username")
+            usuario.first_name = from_user.get("first_name")
+            usuario.last_name = from_user.get("last_name")
+            db.commit()
+            db.refresh(usuario)
+            return usuario
+
+        usuario = Usuario(
+            telegram_id=telegram_id,
+            username=from_user.get("username"),
+            first_name=from_user.get("first_name"),
+            last_name=from_user.get("last_name"),
+            rol="user",
+            creditos_total=10,     # usuario nuevo arranca con 10 créditos
+            creditos_usados=0,
+        )
+        db.add(usuario)
+        db.commit()
+        db.refresh(usuario)
+        return usuario
+    finally:
+        db.close()
+
+
+def get_consulta_config(tipo_consulta: int) -> Optional[ConsultaConfig]:
+    db = get_db()
+    try:
+        return (
+            db.query(ConsultaConfig)
+            .filter_by(tipo_consulta=tipo_consulta)
+            .one_or_none()
+        )
+    finally:
+        db.close()
+
+
+def usuario_creditos_disponibles(usuario: Usuario) -> int:
+    """
+    total - usados (no puede ser negativo)
+    """
+    return max(usuario.creditos_total - usuario.creditos_usados, 0)
+
+
+def registrar_mensaje_pendiente(
+    usuario: Usuario,
+    tipo_consulta: int,
+    nombre_servicio: str,
+    parametros: Dict[str, Any],
+    valor_consulta: int,
+) -> int:
+    """
+    Registra la consulta en estado 'pendiente'.
+    No descuenta créditos todavía.
+    """
+    db = get_db()
+    try:
+        usuario_db = db.query(Usuario).filter_by(id=usuario.id).one()
+
+        msg = Mensaje(
+            usuario_id=usuario_db.id,
+            tipo_consulta=tipo_consulta,
+            nombre_servicio=nombre_servicio,
+            parametros=json.dumps(parametros, ensure_ascii=False),
+            creditos_costo=valor_consulta,
+            estado="pendiente",
+        )
+        db.add(msg)
+        db.commit()
+        db.refresh(msg)
+        return msg.id
+    finally:
+        db.close()
+
+
+def marcar_mensaje_exito_y_cobrar(mensaje_id: int, respuesta_bruta: dict) -> None:
+    """
+    Marca el mensaje como 'exito' y descuenta créditos al usuario asociado.
+    """
+    db = get_db()
+    try:
+        msg = db.query(Mensaje).filter_by(id=mensaje_id).one_or_none()
+        if not msg:
+            return
+
+        usuario = db.query(Usuario).filter_by(id=msg.usuario_id).one()
+
+        msg.estado = "exito"
+        msg.respuesta_bruta = json.dumps(respuesta_bruta, ensure_ascii=False)
+
+        usuario.creditos_usados += msg.creditos_costo
+        usuario.ultima_consulta = datetime.utcnow()
+
+        db.commit()
+    finally:
+        db.close()
+
+
+def marcar_mensaje_error_o_sin_datos(
+    mensaje_id: int,
+    estado: str,
+    mensaje_error: str = "",
+    respuesta_bruta: Optional[dict] = None,
+) -> None:
+    """
+    Marca el mensaje como 'error' o 'sin_datos'.
+    No descuenta créditos.
+    """
+    db = get_db()
+    try:
+        msg = db.query(Mensaje).filter_by(id=mensaje_id).one_or_none()
+        if not msg:
+            return
+
+        msg.estado = estado
+        msg.mensaje_error = mensaje_error or estado
+        if respuesta_bruta is not None:
+            msg.respuesta_bruta = json.dumps(respuesta_bruta, ensure_ascii=False)
+
+        db.commit()
+    finally:
+        db.close()
+
+# =====================================================================
+# 6. TEXTOS Y TECLADOS TELEGRAM
+# =====================================================================
+
+# Intentamos importar textos.py; si no existe, definimos valores por defecto
+try:
+    import textos
+except ImportError:
+    class textos:
+        MENSAJE_BIENVENIDA = (
+            "👋 *Bienvenido a Bot_Telegram_V1.1*\n\n"
+            "Elige el tipo de consulta con los botones de abajo.\n\n"
+            "Modo rápido (firma): `CC 123456789`.\n"
+            "Escribe `/saldo` para ver tus créditos."
+        )
+        MENSAJE_SIN_CREDITOS = (
+            "⚠️ No tienes créditos suficientes para realizar esta consulta."
+        )
+        MENSAJE_ERROR_GENERICO = (
+            "❌ Ocurrió un error realizando la consulta.\n"
+            "Por favor inténtalo de nuevo más tarde."
+        )
+        MENSAJE_SIN_DATOS = "ℹ️ La consulta fue procesada pero no se encontraron datos para los parámetros enviados."
+        MENSAJE_SALDO = (
+            "💰 *Tu saldo de créditos*\n\n"
+            "Totales: {total}\n"
+            "Usados: {usados}\n"
+            "Disponibles: {disponibles}\n"
+        )
+
+
+def enviar_mensaje(chat_id: int, texto: str, reply_markup: Optional[dict] = None):
+    """
+    Wrapper para enviar mensajes a Telegram.
+    """
+    payload = {
+        "chat_id": chat_id,
+        "text": texto,
+        "parse_mode": "Markdown",
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+
+    try:
+        resp = requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[ERROR] Enviando mensaje a Telegram: {e}")
+
+
+def enviar_documento_firma_desde_b64(chat_id: int, firma_b64: str):
+    """
+    Decodifica la firma en base64 y la envía a Telegram como documento (GIF/imagen).
+    """
+    try:
+        if not firma_b64:
+            return
+
+        image_bytes = base64.b64decode(firma_b64)
+
+        files = {
+            "document": ("firma.gif", image_bytes)  # la firma es un GIF (R0lGOD...)
+        }
+        data = {
+            "chat_id": chat_id,
+            "caption": "🖊 Firma registrada",
+        }
+
+        resp = requests.post(
+            f"{TELEGRAM_API_URL}/sendDocument",
+            data=data,
+            files=files,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        print("[DEBUG] Firma enviada como documento a Telegram")
+    except Exception as e:
+        print(f"[ERROR] Enviando imagen de firma a Telegram: {e}")
+
+
+def enviar_documento_pdf(chat_id: int, nombre_archivo: str, pdf_bytes: bytes):
+    """
+    Envía un PDF a Telegram como documento, usando bytes en memoria.
+    """
+    try:
+        files = {
+            "document": (nombre_archivo, pdf_bytes, "application/pdf")
+        }
+        data = {
+            "chat_id": chat_id,
+            "caption": "📄 Informe vehicular generado",
+        }
+
+        resp = requests.post(
+            f"{TELEGRAM_API_URL}/sendDocument",
+            data=data,
+            files=files,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        print("[DEBUG] PDF vehicular enviado como documento a Telegram")
+    except Exception as e:
+        print(f"[ERROR] Enviando PDF vehicular a Telegram: {e}")
+
+
+def teclado_menu_principal():
+    """
+    Teclado principal.
+    """
+    return {
+        "keyboard": [
+            ["📝 Consulta de firma", "🧍 Consulta de persona"],
+            ["🚗 Consulta de vehículo", "👤 Propietario por placa"],
+            ["/saldo"],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+    }
+
+
+def teclado_tipos_documento():
+    """
+    Teclado para elegir tipo de documento (CC, TI, NIT).
+    Útil tanto para firma como para persona.
+    """
+    return {
+        "keyboard": [
+            ["CC - Cédula", "TI - Tarjeta de identidad"],
+            ["NIT - NIT"],
+            ["⬅ Volver al menú"],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+    }
+
+# =====================================================================
+# 7. ESTADO EN MEMORIA POR USUARIO
+# =====================================================================
+
+user_states: Dict[int, Dict[str, Any]] = {}
+
+
+def set_user_state(chat_id: int, estado: Optional[str], datos: Optional[Dict[str, Any]] = None):
+    user_states[chat_id] = {"estado": estado, "datos": datos or {}}
+
+
+def get_user_state(chat_id: int) -> Dict[str, Any]:
+    return user_states.get(chat_id, {"estado": None, "datos": {}})
+
+# =====================================================================
+# 8. LLAMADAS A LA API HÉRCULES
+# =====================================================================
+
+def llamar_iniciar_consulta(tipo_consulta: int, mensaje_payload: Any) -> str:
+    """
+    Llama a POST /api/IniciarConsulta y devuelve el IdPeticion.
+
+    Formatos de respuesta soportados:
+
+    1) Formato NUEVO:
+       { "IdPeticion": "guid..." }
+
+    2) Formato ANTIGUO:
+       { "Tipo": 0, "Mensaje": "guid..." }
+
+    Además:
+      - Si mensaje_payload es dict/list -> se serializa a JSON.
+      - Si mensaje_payload es str -> se manda tal cual (sin json.dumps).
+    """
+    url = f"{API_BASE}/api/IniciarConsulta"
+
+    if isinstance(mensaje_payload, (dict, list)):
+        mensaje_str = json.dumps(mensaje_payload, ensure_ascii=False)
+    else:
+        mensaje_str = str(mensaje_payload)
+
+    body = {
+        "token": HERCULES_TOKEN,
+        "tipo": tipo_consulta,
+        "mensaje": mensaje_str,
+    }
+
+    print(f"[DEBUG] IniciarConsulta payload: {body}")
+
+    resp = requests.post(url, json=body, timeout=30)
+
+    try:
+        resp.raise_for_status()
+    except Exception:
+        print(f"[ERROR] HTTP IniciarConsulta status={resp.status_code}, body={resp.text}")
+        raise
+
+    data = resp.json()
+    print(f"[DEBUG] Respuesta IniciarConsulta: {data}")
+
+    # Formato NUEVO
+    id_peticion = data.get("IdPeticion") or data.get("idPeticion")
+    if id_peticion:
+        return str(id_peticion)
+
+    # Formato ANTIGUO
+    tipo = data.get("Tipo")
+    if tipo is None:
+        tipo = data.get("tipo")
+
+    mensaje = data.get("Mensaje") or data.get("mensaje")
+
+    if tipo == 0 and mensaje:
+        return str(mensaje)
+
+    raise RuntimeError(f"Respuesta no esperada de IniciarConsulta: {data}")
+
+
+def llamar_resultados(id_peticion: str) -> dict:
+    """
+    Llama a GET /api/resultados/{token}/{idPeticion}
+    Respuesta esperada:
+      { "Tipo": 0|1|2, "Mensaje": "..." }
+    """
+    url = f"{API_BASE}/api/resultados/{HERCULES_TOKEN}/{id_peticion}"
+
+    resp = requests.get(url, timeout=30)
+    if resp.status_code != 200:
+        print(f"[ERROR] HTTP resultados status={resp.status_code}, body={resp.text}")
+        resp.raise_for_status()
+
+    data = resp.json()
+    print(f"[DEBUG] Respuesta Resultados: {data}")
+    return data
+
+
+def es_respuesta_exitosa_hercules(data: dict) -> bool:
+    """
+    Determina si la respuesta de Hércules es considerada "exitosa"
+    para efectos de COBRO de créditos.
+
+    Criterio:
+      - Tipo == 0 (aceptando 0 o "0")
+      - Mensaje no vacío
+      - Si existe 'Error' == True o 'error' con mensaje de no encontrado -> fallo
+      - Si existe 'codigoResultado' y es distinto de 'EXITOSO' -> fallo
+      - En cualquier otro caso con Tipo == 0 -> éxito.
+    """
+    try:
+        if isinstance(data, str):
+            data = json.loads(data)
+
+        if not isinstance(data, dict):
+            print(f"[DEBUG] es_respuesta_exitosa_hercules: data no es dict: {type(data)}")
+            return False
+
+        # 1) Validar Tipo == 0
+        tipo = data.get("Tipo")
+        if tipo is None:
+            tipo = data.get("tipo")
+
+        if str(tipo) != "0":
+            print(f"[DEBUG] es_respuesta_exitosa_hercules: Tipo != 0 -> {tipo}")
+            return False
+
+        # 2) Extraer Mensaje
+        mensaje_raw = data.get("Mensaje") or data.get("mensaje")
+        if not mensaje_raw:
+            print("[DEBUG] es_respuesta_exitosa_hercules: Mensaje vacío")
+            return False
+
+        if isinstance(mensaje_raw, str):
+            try:
+                mensaje_json = json.loads(mensaje_raw)
+            except Exception:
+                # No se pudo parsear, pero hay contenido y Tipo == 0 -> éxito
+                print("[DEBUG] es_respuesta_exitosa_hercules: no se pudo parsear Mensaje, pero hay contenido.")
+                return True
+        elif isinstance(mensaje_raw, dict):
+            mensaje_json = mensaje_raw
+        else:
+            print(f"[DEBUG] es_respuesta_exitosa_hercules: Mensaje tipo {type(mensaje_raw)}, lo aceptamos.")
+            return True
+
+        # 3) Revisar banderas de error
+        if isinstance(mensaje_json, dict):
+            # Error explícito en mayúscula
+            if mensaje_json.get("Error") is True:
+                print("[DEBUG] es_respuesta_exitosa_hercules: Error == True en mensaje_json")
+                return False
+
+            # codigoResultado distinto de EXITOSO
+            codigo = mensaje_json.get("codigoResultado") or mensaje_json.get("codigo")
+            if codigo and str(codigo).upper() != "EXITOSO":
+                print(f"[DEBUG] es_respuesta_exitosa_hercules: codigoResultado != EXITOSO -> {codigo}")
+                return False
+
+            # error en minúscula con texto tipo "Vehiculo no encontrado"
+            err_text = mensaje_json.get("error")
+            if isinstance(err_text, str) and "no encontrado" in err_text.lower():
+                print(f"[DEBUG] es_respuesta_exitosa_hercules: error de 'no encontrado' -> {err_text}")
+                return False
+
+        # 4) Si llegamos aquí, consideramos éxito
+        return True
+
+    except Exception as e:
+        print(f"[ERROR] Analizando respuesta de Hércules: {e}")
+        return False
+
+# =====================================================================
+# 9. GENERACIÓN DE INFORME VEHICULAR (PDF B7 v2)
+# =====================================================================
+
+def generar_informe_vehicular_B7_v2(data: dict, qr_url: str = "https://t.me/QuantumFBot") -> bytes:
+    """
+    Genera el informe vehicular en PDF (plantilla B7 v2) en memoria
+    y devuelve los bytes del archivo.
+
+    Soporta que 'Mensaje' venga como string JSON o como dict ya deserializado.
+    """
+    mensaje_raw = data.get("Mensaje") or data.get("mensaje") or ""
+
+    # --- NUEVO: soportar string o dict en Mensaje ---
+    info = {}
+    if isinstance(mensaje_raw, str):
+        try:
+            info = json.loads(mensaje_raw)
+        except Exception as e:
+            print(f"[ERROR] generar_informe_vehicular_B7_v2: no se pudo json.loads(Mensaje): {e}")
+            info = {}
+    elif isinstance(mensaje_raw, dict):
+        info = mensaje_raw
+    else:
+        print(f"[WARN] generar_informe_vehicular_B7_v2: Mensaje es tipo inesperado: {type(mensaje_raw)}")
+        info = {}
+
+    # Soportar dos estructuras:
+    # 1) {"vehiculo": {"datos":..., "adicional":...}, "persona": {...}}
+    # 2) {"datos":..., "adicional":...} (solo vehículo)
+    vehiculo_info = info.get("vehiculo") or {}
+    if not vehiculo_info and isinstance(info, dict) and "datos" in info:
+        vehiculo_info = {
+            "datos": info.get("datos") or {},
+            "adicional": info.get("adicional") or {},
+        }
+
+    datos_vehiculo = vehiculo_info.get("datos", {}) or {}
+    adicional = vehiculo_info.get("adicional", {}) or {}
+
+    persona_info = info.get("persona", {}) or {}
+    person = persona_info.get("person", {}) or {}
+    ubic_list = persona_info.get("ubicabilidad") or []
+    ubic = ubic_list[0] if ubic_list else {}
+
+    # ==========================
+    # 1. Datos vehículo
+    # ==========================
+    placa = datos_vehiculo.get("placaNumeroUnicoIdentificacion", "-")
+    clase = datos_vehiculo.get("claseVehiculo", "-")
+    servicio = datos_vehiculo.get("servicio", "-")
+    estado_registro = datos_vehiculo.get("estadoRegistroVehiculo", "-")
+
+    marca = datos_vehiculo.get("marcaVehiculo", "-")
+    linea = datos_vehiculo.get("lineaVehiculo", "-")
+    modelo = datos_vehiculo.get("modelo", "-")
+    color = datos_vehiculo.get("color", "-")
+    carroceria = datos_vehiculo.get("carroceria", "-")
+    cilindraje = datos_vehiculo.get("cilindraje", "-")
+
+    nro_serie = "-"
+    vin = datos_vehiculo.get("vin", "-")
+    numero_motor = datos_vehiculo.get("numeroMotor", "-")
+    numero_chasis = datos_vehiculo.get("numeroChasis", "-")
+
+    importado = datos_vehiculo.get("origenRegistro", "-")
+    radio_accion = "-"
+    nivel_servicio = "-"
+    tipo_combustible = (
+        datos_vehiculo.get("tipoCombustible")
+        or datos_vehiculo.get("combustible")
+        or datos_vehiculo.get("tipoCombustibleVehiculo")
+        or "-"
+    )
+    estado_vehiculo = estado_registro
+    modalidad_servicio = "-"
+
+    regrab_motor = "-"
+    regrab_chasis = "-"
+    regrab_serie = "-"
+    regrab_vin = "-"
+
+    tiene_gravamen = datos_vehiculo.get("poseeGravamenes", "-")
+    vehiculo_rematado = "-"
+    medidas_cautelares = "-"
+
+    transmision = datos_vehiculo.get("tipoTransmision", "-")
+    traccion = datos_vehiculo.get("tipoTraccion", "-")
+    nivel_emisiones = datos_vehiculo.get("nivelEmisiones", "-")
+
+    aspiracion = datos_vehiculo.get("tipoAspiracion", "-")
+    freno = datos_vehiculo.get("tipoFreno", "-")
+
+    info_veh_dto = adicional.get("informacionVehiculoDTO", {}) or {}
+    blindado = info_veh_dto.get("blindado", "-")
+
+    # ==========================
+    # 2. Propietario
+    # ==========================
+    nombre_prop = " ".join(
+        [
+            person.get("nombre1", ""),
+            person.get("nombre2", ""),
+            person.get("apellido1", ""),
+            person.get("apellido2", ""),
+        ]
+    ).strip() or "-"
+
+    prop_tipo_doc = person.get("idTipoDoc") or person.get("tipoDocumento") or "-"
+    prop_num_doc = person.get("nroDocumento") or person.get("numeroDocumento") or "-"
+
+    direccion = ubic.get("direccion", "-")
+    municipio_raw = ubic.get("municipio", "") or "-"
+    if " - " in municipio_raw:
+        ciudad, departamento = [x.strip() for x in municipio_raw.split(" - ", 1)]
+    else:
+        ciudad = municipio_raw
+        departamento = "-"
+
+    telefono = ubic.get("telefono") or person.get("celular") or "-"
+    correo = ubic.get("correoElectronico") or person.get("email") or "-"
+
+    # ==========================
+    # 3. Licencias
+    # ==========================
+    licencias_list = []
+    lista_comparendos = adicional.get("listaComparendos") or []
+    if lista_comparendos:
+        comp = lista_comparendos[0]
+        for lic in comp.get("listaLicencias") or []:
+            licencias_list.append(
+                {
+                    "numero": lic.get("numeroLicencia", "") or "",
+                    "categoria": lic.get("categoria", "") or "",
+                    "fechaExpedicion": lic.get("fechaExpedicion", "") or "",
+                    "fechaVencimiento": lic.get("fechaVencimiento", "") or "",
+                    "estado": lic.get("estado", "") or "",
+                }
+            )
+
+    # ==========================
+    # 4. SOAT y RTM
+    # ==========================
+    lista_polizas = adicional.get("listaPolizas") or []
+    soat_list = [
+        p for p in lista_polizas
+        if (p.get("tipoPoliza", "") or "").upper() == "SOAT"
+    ]
+
+    def calcular_vigente(fecha_str, formato="%d/%m/%Y"):
+        try:
+            fecha = datetime.strptime(fecha_str, formato).date()
+            hoy = datetime.now().date()
+            return "SI" if fecha >= hoy else "NO"
+        except Exception:
+            return "-"
+
+    soat_vigente = "SI" if any(
+        calcular_vigente(p.get("fechaVencimiento", "")) == "SI" for p in soat_list
+    ) else "NO"
+
+    rtm_list = adicional.get("listaRtm") or []
+    rtm_vigente = "SI" if any(
+        calcular_vigente(r.get("fechaVigencia", "")) == "SI" for r in rtm_list
+    ) else "NO"
+
+    inscrito_runt = datos_vehiculo.get("vehiculoInscritoRUNT", "-")
+    gravamenes = datos_vehiculo.get("poseeGravamenes", "-")
+    tarjeta_servicios = datos_vehiculo.get("numeroTarjetaServicios", "-")
+    tarjeta_vence = datos_vehiculo.get("fechaVencimientoTarjetaServicios", "-") or "-"
+
+    # ==========================
+    # 5. Estilos ReportLab
+    # ==========================
+    styles = getSampleStyleSheet()
+
+    section_title_style = ParagraphStyle(
+        name="SectionTitle",
+        parent=styles["Heading2"],
+        fontName="Helvetica-Bold",
+        fontSize=12,
+        textColor=colors.HexColor("#003366"),
+        spaceBefore=6,
+        spaceAfter=4,
+    )
+    normal_style = styles["Normal"]
+    normal_style.fontSize = 9
+
+    small_style = ParagraphStyle(
+        name="Small",
+        parent=styles["Normal"],
+        fontSize=8,
+    )
+
+    def cell(t):
+        return Paragraph(str(t if t is not None else "-"), normal_style)
+
+    def cell_small(t):
+        return Paragraph(str(t if t is not None else "-"), small_style)
+
+    # ==========================
+    # 6. QR en imagen temporal
+    # ==========================
+    qr_path = "qr_temp_informe_vehicular.png"
+    qr_obj = qrcode.QRCode(box_size=8, border=1)
+    qr_obj.add_data(qr_url)
+    qr_obj.make(fit=True)
+    img = qr_obj.make_image(fill_color="black", back_color="white")
+    img.save(qr_path)
+
+    # ==========================
+    # 7. Construir PDF en memoria
+    # ==========================
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=20 * mm,
+        rightMargin=20 * mm,
+        topMargin=45 * mm,
+        bottomMargin=15 * mm,
+    )
+    total_width = doc.width
+    story = []
+
+    # ---------- 1. Datos principales ----------
+    story.append(Paragraph("1. Datos principales del vehículo", section_title_style))
+    tabla_datos_principales = Table(
+        [
+            [cell("Placa"), cell(placa), cell("Clase"), cell(clase)],
+            [cell("Servicio"), cell(servicio), cell("Estado del registro"), cell(estado_registro)],
+        ],
+        colWidths=[total_width / 4] * 4,
+    )
+    tabla_datos_principales.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EEEEEE")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#003366")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+            ]
+        )
+    )
+    story.append(tabla_datos_principales)
+    story.append(Spacer(1, 6))
+
+    # ---------- 2. Información de propietario ----------
+    story.append(Paragraph("2. Información de propietario", section_title_style))
+
+    tabla_propietario = Table(
+        [
+            [cell("Nombre / Razón social"), cell(nombre_prop)],
+            [cell("Tipo y número de documento"), cell(f"{prop_tipo_doc} {prop_num_doc}")],
+        ],
+        colWidths=[total_width / 2, total_width / 2],
+    )
+    tabla_propietario.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F5F5F5")),
+                ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#003366")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+            ]
+        )
+    )
+    story.append(tabla_propietario)
+    story.append(Spacer(1, 4))
+
+    tabla_ubicacion = Table(
+        [
+            [cell("Departamento"), cell(departamento), cell("Ciudad"), cell(ciudad)],
+            [cell("Dirección"), cell(direccion), cell("Teléfono"), cell(telefono)],
+            [cell("Correo"), cell(correo), cell(""), cell("")],
+        ],
+        colWidths=[total_width / 4] * 4,
+    )
+    tabla_ubicacion.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EEEEEE")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#003366")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+            ]
+        )
+    )
+    story.append(tabla_ubicacion)
+    story.append(Spacer(1, 4))
+
+    # Licencias solo si existen
+    if licencias_list:
+        tabla_lic_title = Table(
+            [[Paragraph("<b>LICENCIAS DE CONDUCCIÓN</b>", normal_style)]],
+            colWidths=[total_width],
+        )
+        tabla_lic_title.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#DDDDDD")),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("BOX", (0, 0), (-1, -1), 0.5, colors.black),
+                ]
+            )
+        )
+        story.append(tabla_lic_title)
+
+        lic_header = [
+            cell_small("No. licencia"),
+            cell_small("Categoría"),
+            cell_small("Fecha expedición"),
+            cell_small("Fecha vencimiento"),
+            cell_small("Estado"),
+        ]
+        lic_rows = [lic_header]
+        for lic in licencias_list:
+            lic_rows.append(
+                [
+                    cell_small(lic["numero"]),
+                    cell_small(lic["categoria"]),
+                    cell_small(lic["fechaExpedicion"]),
+                    cell_small(lic["fechaVencimiento"]),
+                    cell_small(lic["estado"]),
+                ]
+            )
+        tabla_lic = Table(
+            lic_rows,
+            colWidths=[
+                total_width * 0.18,
+                total_width * 0.12,
+                total_width * 0.20,
+                total_width * 0.20,
+                total_width * 0.30,
+            ],
+        )
+        tabla_lic.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F5F5F5")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#003366")),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.black),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ]
+            )
+        )
+        story.append(tabla_lic)
+        story.append(Spacer(1, 6))
+
+    # ---------- 3. Características del vehículo ----------
+    story.append(Paragraph("3. Características del vehículo", section_title_style))
+    tabla_caracteristicas = Table(
+        [
+            [cell("Marca"), cell(marca), cell("Modelo"), cell(modelo)],
+            [cell("Línea"), cell(linea), cell("Clase"), cell(clase)],
+            [cell("Color"), cell(color), cell("Carrocería"), cell(carroceria)],
+            [cell("Cilindraje"), cell(cilindraje), cell("Tipo de combustible"), cell(tipo_combustible)],
+            [cell("Nro. Serie"), cell(nro_serie), cell("Nro. VIN"), cell(vin)],
+            [cell("Nro. Motor"), cell(numero_motor), cell("Nro. Chasis"), cell(numero_chasis)],
+            [cell("Importado"), cell(importado), cell("Radio acción"), cell(radio_accion)],
+            [cell("Nivel servicio"), cell(nivel_servicio), cell("Transmisión"), cell(transmision)],
+            [cell("Tracción"), cell(traccion), cell("Nivel de emisiones"), cell(nivel_emisiones)],
+            [cell("Estado del vehículo"), cell(estado_vehiculo), cell("Modalidad servicio"), cell(modalidad_servicio)],
+            [cell("Regrabación motor"), cell(regrab_motor), cell("Regrabación chasis"), cell(regrab_chasis)],
+            [cell("Regrabación serie"), cell(regrab_serie), cell("Regrabación VIN"), cell(regrab_vin)],
+            [cell("Tiene gravamen"), cell(tiene_gravamen), cell("Vehículo rematado"), cell(vehiculo_rematado)],
+            [cell("Tiene medidas cautelares"), cell(medidas_cautelares), cell(""), cell("")],
+        ],
+        colWidths=[total_width / 4] * 4,
+    )
+    tabla_caracteristicas.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EEEEEE")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#003366")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+            ]
+        )
+    )
+    story.append(tabla_caracteristicas)
+    story.append(Spacer(1, 6))
+
+    # ---------- Forzar sección 4 a nueva página ----------
+    story.append(PageBreak())
+
+    # ---------- 4. Estado de documentos y seguridad ----------
+    story.append(Paragraph("4. Estado de documentos y seguridad", section_title_style))
+    tabla_docs_resumen = Table(
+        [
+            [cell("Inscrito en RUNT"), cell(inscrito_runt), cell("Gravámenes"), cell(gravamenes)],
+            [cell("Tarjeta de servicios"), cell(tarjeta_servicios), cell("Vigencia tarjeta"), cell(tarjeta_vence)],
+            [cell("SOAT vigente"), cell(soat_vigente), cell("RTM vigente"), cell(rtm_vigente)],
+        ],
+        colWidths=[total_width / 4] * 4,
+    )
+    tabla_docs_resumen.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EEEEEE")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#003366")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+            ]
+        )
+    )
+    story.append(tabla_docs_resumen)
+    story.append(Spacer(1, 4))
+
+    if soat_list:
+        tabla_soat_title = Table(
+            [[Paragraph("<b>SOAT</b>", normal_style)]],
+            colWidths=[total_width],
+        )
+        tabla_soat_title.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#DDDDDD")),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("BOX", (0, 0), (-1, -1), 0.5, colors.black),
+                ]
+            )
+        )
+        story.append(tabla_soat_title)
+
+        soat_header = [
+            cell_small("No. Póliza"),
+            cell_small("Fecha inicio vigencia"),
+            cell_small("Fecha fin vigencia"),
+            cell_small("Entidad que expide SOAT"),
+            cell_small("Vigente"),
+        ]
+        soat_rows = [soat_header]
+        for pol in soat_list:
+            soat_rows.append(
+                [
+                    cell_small(pol.get("numeroPoliza", "-")),
+                    cell_small(pol.get("fechaInicio", "-")),
+                    cell_small(pol.get("fechaVencimiento", "-")),
+                    cell_small(pol.get("aseguradora", "-")),
+                    cell_small(calcular_vigente(pol.get("fechaVencimiento", "-"))),
+                ]
+            )
+        tabla_soat = Table(
+            soat_rows,
+            colWidths=[
+                total_width * 0.20,
+                total_width * 0.16,
+                total_width * 0.16,
+                total_width * 0.33,
+                total_width * 0.15,
+            ],
+        )
+        tabla_soat.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F5F5F5")),
                     ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#003366")),
                     ("GRID", (0, 0), (-1, -1), 0.25, colors.black),
                     ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -468,7 +1625,7 @@ def formatear_respuesta_vehiculo(data: dict) -> str:
         partes.append(f"• Estado del registro: {estado_registro}")
         partes.append("")
 
-        # 2. Características del vehículo
+        # 2. Características del vehículo (una sola etiqueta por línea)
         partes.append("*2. Características del vehículo*")
         partes.append(f"• Marca: {marca}")
         partes.append(f"• Línea: {linea}")
@@ -668,12 +1825,12 @@ def iniciar_consulta_persona(usuario: Usuario, chat_id: int, tipo_doc: str, num_
 
 def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
     """
-    Consulta de vehículo por placa utilizando tipo 1 (vehículo + persona).
-    En IniciarConsulta la API espera:
-      "mensaje": "PDK400"
-    (solo la placa, no JSON).
+    Consulta de vehículo por placa.
+
+    AHORA: se hace con el tipo 1 (TIPO_CONSULTA_VEHICULO_PERSONA)
+    para obtener vehículo + datos de persona y con eso generar el PDF.
+    La API espera solo la placa como string.
     """
-    # Usamos el tipo 1 en la configuración
     config = get_consulta_config(TIPO_CONSULTA_VEHICULO_PERSONA)
     if not _verificar_creditos_o_mensaje(chat_id, usuario, config):
         return
@@ -682,7 +1839,6 @@ def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
     mensaje_payload = placa_limpia
 
     try:
-        # Aquí ya usamos tipo 1
         id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_VEHICULO_PERSONA, mensaje_payload)
     except Exception as e:
         print(f"[ERROR] iniciar_consulta_vehiculo -> IniciarConsulta: {e}")
@@ -691,8 +1847,8 @@ def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
 
     msg_id = registrar_mensaje_pendiente(
         usuario=usuario,
-        tipo_consulta=TIPO_CONSULTA_VEHICULO_PERSONA,   # guardamos tipo 1
-        nombre_servicio="vehiculo_placa",
+        tipo_consulta=TIPO_CONSULTA_VEHICULO_PERSONA,
+        nombre_servicio="vehiculo_persona",
         parametros={"placa": placa_limpia},
         valor_consulta=config.valor_consulta,
     )
@@ -701,7 +1857,7 @@ def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
         chat_id=chat_id,
         usuario=usuario,
         mensaje_id=msg_id,
-        tipo_consulta=TIPO_CONSULTA_VEHICULO_PERSONA,   # el hilo sabe que es tipo 1
+        tipo_consulta=TIPO_CONSULTA_VEHICULO_PERSONA,
         mensaje_parametro_str=placa_limpia,
         id_peticion=id_peticion,
         formateador_respuesta=formatear_respuesta_vehiculo,
@@ -762,6 +1918,8 @@ def ejecutar_consulta_en_hilo(
     Hilo que hace polling a /resultados y decide si se cobra o no.
     Ahora también permite que, en caso de consulta de vehículo,
     se genere y envíe un PDF con el informe vehicular.
+
+    Para el PDF se utiliza ahora el tipo 1 (vehículo + persona).
     """
 
     def _run():
@@ -827,8 +1985,7 @@ def ejecutar_consulta_en_hilo(
                 if firma_b64:
                     enviar_documento_firma_desde_b64(chat_id, firma_b64)
 
-                # === Si es consulta de vehículo, generamos y enviamos PDF ===
-                # Aceptamos tipo 1 (vehículo + persona) y 3 por compatibilidad
+                # === NUEVO: si es consulta de vehículo (tipo 1 o 3), generamos y enviamos PDF ===
                 if tipo_consulta in (TIPO_CONSULTA_VEHICULO_PERSONA, TIPO_CONSULTA_VEHICULO_SOLO):
                     try:
                         # Intentamos extraer la placa para usarla en el nombre del archivo
