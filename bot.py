@@ -184,7 +184,7 @@ class ConsultaConfig(Base):
 
 TIPO_CONSULTA_VEHICULO_PERSONA = 1
 TIPO_CONSULTA_VEHICULO_CHASIS = 2
-TIPO_CONSULTA_VEHICULO_SOLO = 1
+TIPO_CONSULTA_VEHICULO_SOLO = 3
 TIPO_CONSULTA_PROPIETARIO_POR_PLACA = 4
 TIPO_CONSULTA_PERSONA = 5
 TIPO_CONSULTA_FIRMA = 8
@@ -1825,7 +1825,7 @@ def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
     mensaje_payload = placa_limpia
 
     try:
-        id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_VEHICULO_SOLO, mensaje_payload)
+        id_peticion = llamar_iniciar_consulta(TIPO_CONSULTA_VEHICULO_PERSONA, mensaje_payload)
     except Exception as e:
         print(f"[ERROR] iniciar_consulta_vehiculo -> IniciarConsulta: {e}")
         enviar_mensaje(chat_id, textos.MENSAJE_ERROR_GENERICO)
@@ -1833,17 +1833,17 @@ def iniciar_consulta_vehiculo(usuario: Usuario, chat_id: int, placa: str):
 
     msg_id = registrar_mensaje_pendiente(
         usuario=usuario,
-        tipo_consulta=TIPO_CONSULTA_VEHICULO_SOLO,
+        tipo_consulta=TIPO_CONSULTA_VEHICULO_PERSONA,
         nombre_servicio="vehiculo_placa",
         parametros={"placa": placa_limpia},
         valor_consulta=config.valor_consulta,
     )
 
     ejecutar_consulta_en_hilo(
-        chat_id=chat_id,
+TIPO_CONSULTA_VEHICULO_PERSONA,       chat_id=chat_id,
         usuario=usuario,
         mensaje_id=msg_id,
-        tipo_consulta=TIPO_CONSULTA_VEHICULO_SOLO,
+        tipo_consulta=TIPO_CONSULTA_VEHICULO_PERSONA,
         mensaje_parametro_str=placa_limpia,
         id_peticion=id_peticion,
         formateador_respuesta=formatear_respuesta_vehiculo,
